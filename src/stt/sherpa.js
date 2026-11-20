@@ -4,21 +4,25 @@
 // Everything runs on this computer; nothing here touches the network.
 import os from 'node:os'
 import { loadSherpa, modelState, readVoiceConfig } from './install.js'
+import { allWords, buildHotwords, readVocab } from './hotwords.js'
 import { DEFAULT_MODEL, MODELS, VAD_MODEL, modelPath } from './models.js'
 
 export const IDLE_RELEASE_MS = 10 * 60 * 1000
 export const SAMPLE_RATE = 16000
+/** default bias for the developer words (see hotwords.js); chosen by measurement, see testy-e2e/agenci/stt/WYNIKI.md */
+export const HOTWORD_SCORE = 2.0
 
 export const threads = () => Math.max(1, Math.min(4, Math.floor((os.cpus().length || 2) / 2)))
 
 /** @param {string} id @param {number} numThreads */
-export function recognizerConfig(id, numThreads = threads()) {
+export function recognizerConfig(id, numThreads = threads(), hotwords = false) {
   const m = MODELS[id]
   const p = (/** @type {string} */ n) => modelPath(id, n)
   const names = m.files.map((f) => f.name)
   const find = (/** @type {RegExp} */ re) => p(/** @type {string} */ (names.find((n) => re.test(n))))
   if (m.kind === 'transducer') {
     return {
+      ...(hotwords ? { decodingMethod: 'modified_beam_search', maxActivePaths: 4 } : {}),
       featConfig: { sampleRate: SAMPLE_RATE, featureDim: 80 },
       modelConfig: {
         transducer: { encoder: find(/encoder/), decoder: find(/decoder/), joiner: find(/joiner/) },
@@ -44,11 +48,14 @@ export function vadConfig() {
 }
 
 export class SherpaEngine {
-  /** @param {{ model?: string, log?: (m: string, f?: Record<string, any>) => void, idleMs?: number }} [o] */
+  /** @param {{ model?: string, log?: (m: string, f?: Record<string, any>) => void, idleMs?: number, hotwords?: number | false }} [o] */
   constructor(o = {}) {
     this.log = o.log || (() => {})
     this.idleMs = o.idleMs ?? IDLE_RELEASE_MS
     this.modelId = o.model || null
+    /** hotword score for transducer models (0 / false = off); HINTY_AGENTS_HOTWORDS=off turns it off everywhere */
+    this.hotwordScore = process.env.HINTY_AGENTS_HOTWORDS === 'off' ? 0 : (o.hotwords === undefined ? HOTWORD_SCORE : o.hotwords || 0)
+    /** @type {string} */ this.hwText = ''
     /** @type {any} */ this.sherpa = null
     /** @type {any} */ this.rec = null
     /** @type {Promise<any> | null} */ this.loading = null
@@ -75,7 +82,11 @@ export class SherpaEngine {
     this.loading = (async () => {
       this.sherpa = this.sherpa || loadSherpa()
       const t0 = Date.now()
-      const rec = await this.sherpa.OfflineRecognizer.createAsync(recognizerConfig(id))
+      this.hwText = ''
+      if (MODELS[id].kind === 'transducer' && this.hotwordScore) {
+        this.hwText = buildHotwords(allWords(), readVocab(modelPath(id, 'tokens.txt')), this.hotwordScore)
+      }
+      const rec = await this.sherpa.OfflineRecognizer.createAsync(recognizerConfig(id, threads(), !!this.hwText))
       this.rec = rec
       this.log('stt_loaded', { model: id, ms: Date.now() - t0 })
       return rec
@@ -152,7 +163,9 @@ export class SherpaEngine {
       const rec = await this.load()
       this.busy++
       try {
-        const stream = rec.createStream()
+        const stream = this.hwText ? rec.createStream(this.hwText) : rec.createStream()
+        // Whisper stops at 6 tokens per second by default, which cuts long or token-heavy (Polish) speech short
+        if (MODELS[this.modelName].kind === 'whisper') stream.setOption('max_tokens_per_second', '30')
         stream.acceptWaveform({ sampleRate: SAMPLE_RATE, samples })
         await rec.decodeAsync(stream)
         const r = rec.getResult(stream)

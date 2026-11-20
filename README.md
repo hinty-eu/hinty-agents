@@ -91,12 +91,40 @@ npx hinty-agents away off     # back at the desk
 | `install claude` / `uninstall claude` | add or remove the Claude Code plugin |
 | `doctor` | checks Node, Claude Code, the plugin (`claude plugin validate`), the service, the link, the hook and whether the mod reports in |
 | `unpair` | disconnect this computer from your account and delete the token |
+| `voice install` / `status` / `remove` | local speech to text for dictation from the glasses (see Voice) |
 | `start` / `stop` | start or stop the background service (`stop` also keeps it from starting with the next session) |
 
 After a reboot the SessionStart hook starts the service again (unless you ran `stop`).
 
 Environment: `HINTY_AGENTS_API` (server for a new pairing, default `https://api.v1.hinty.eu`),
 `HINTY_AGENTS_HOME` (data folder, default `~/.hinty-agents`).
+
+## Voice (dictate to your agents from the glasses)
+
+Local speech to text, free, no cloud API. Say an instruction in the glasses' dictation view; the text comes back to the
+glasses, you choose Send / Edit / Add / Cancel, and only Send reaches the agent.
+
+```bash
+npx hinty-agents voice install      # engine + default model (downloads ~0.64 GB)
+npx hinty-agents voice status
+npx hinty-agents voice remove       # deletes the engine and every model
+```
+
+- **Engine:** `sherpa-onnx-node` 2.0.2 (Apache 2.0), installed on demand into `~/.hinty-agents/voice/`, never added to this
+  package's dependencies. Models go to `~/.hinty-agents/models/<id>/`; each file is checked against a pinned size and SHA-256
+  and written atomically. A running service says `hello` again with `stt: true` right after the install.
+- **Models:** `parakeet-v3` (default; NVIDIA Parakeet TDT 0.6b v3 int8, 25 European languages incl. Polish, CC BY 4.0, ~640 MB,
+  ~1 GB RAM while in use), `whisper-small` (358 MB) and `whisper-turbo` (989 MB, too slow on CPU for dictation) with
+  `voice install --model <id>`. Silero VAD (0.6 MB) splits speech into stretches that are recognized while you are still
+  talking. The model loads when dictation starts and is released after 10 idle minutes.
+- **Developer words:** the default model is biased towards ~130 words like commit, rebase, README, endpoint, package.json
+  (`src/stt/hotwords.txt`). Add your own, one per line (`word :2.5` sets a score), in `~/.hinty-agents/hotwords.txt`.
+  `HINTY_AGENTS_HOTWORDS=off` turns the bias off.
+- **Privacy:** audio exists only in memory while one utterance is recognized (at most 35 s, one at a time) and is dropped
+  afterwards; nothing is written to disk and logs hold counts only. Recognition runs on this computer. With away mode off
+  the bridge reads nothing: it only answers `away_off`. Only the recognized text goes back to your own glasses screen.
+- **Accuracy:** measured in `testy-e2e/agenci/stt/WYNIKI.md` of the Hinty repository. English commands are near perfect; Polish
+  sentences with English jargon often need a fix in the preview step.
 
 ## Uninstall
 
@@ -117,7 +145,7 @@ claude plugin validate ./claude-plugin        # check the manifest, hooks and mo
 ```
 
 Use `HINTY_AGENTS_HOME` and `HINTY_AGENTS_API` to keep a test service away from your real one. Plain JavaScript with
-JSDoc types (no build step); the only dependency is `socket.io-client`. The mod's types come from Claude Code: once
+JSDoc types (no build step); the only dependency is `socket.io-client` (the speech engine and models are installed on demand by `voice install`). The mod's types come from Claude Code: once
 it has loaded the plugin, `claude-plugin/.claude-plugin/types/` holds them.
 
 Known limits:
