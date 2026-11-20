@@ -7,6 +7,8 @@ import { createLocalServer, listenLoopback } from './local-http.js'
 import { createLog } from './log.js'
 import { Relay } from './relay.js'
 import { Service } from './service.js'
+import { voiceReady } from './stt/install.js'
+import { SherpaEngine } from './stt/sherpa.js'
 import { ensureHome, isPaired, paths, pidAlive, readConfig, readJson, updateConfig, writeJson } from './store.js'
 import { VERSION } from './version.js'
 
@@ -46,7 +48,9 @@ export async function runDaemon() {
   const relay = new Relay({ api: config.api, token: /** @type {string} */ (config.bridgeToken), log })
   let stopping = false
 
+  const engine = new SherpaEngine({ log })
   const service = new Service({
+    voice: { engine, ready: voiceReady },
     relay: { get connected() { return relay.connected }, emit: (ev, payload) => relay.send(ev, payload) },
     log,
     onUnpaired: (why) => {
@@ -69,6 +73,8 @@ export async function runDaemon() {
       'POST /v1/mod/event': (body) => service.modEvent(body),
       'POST /v1/mod/ack': (body) => service.modAck(body),
       'POST /v1/away': (body) => (body && typeof body.on === 'boolean' ? service.setAway(body.on, 'cli') : { error: 'invalid' }),
+      // after `voice install` / `voice remove`: drop the loaded model and say `hello` again (with or without `stt`)
+      'POST /v1/voice/reload': () => { engine.release(); return service.voiceChanged() },
       'POST /v1/stop': () => { setTimeout(() => void shutdown(0), 50); return { ok: true } },
       'POST /v1/unpair': () => {
         relay.send('unpair')
@@ -92,6 +98,7 @@ export async function runDaemon() {
     log('stop', { code })
     clearInterval(ticker)
     service.stop()
+    engine.release()
     relay.stop()
     server.close()
     server.closeAllConnections?.()

@@ -7,6 +7,7 @@ import { AwayMode } from './away.js'
 import { PermTable } from './perms.js'
 import { SessionTable, SID_RE } from './sessions.js'
 import { glassesLine, oneLine, permText, relayText } from './text.js'
+import { Utterances } from './stt/utterance.js'
 
 export const PROTOCOL_V = 1
 /** Hook `timeout` in hooks.json is 900 s; the request (and the relay's card) expires earlier so the hook can end cleanly. */
@@ -29,7 +30,8 @@ export class Service {
    * @param {{ relay: { connected: boolean, emit: (ev: string, payload?: unknown) => void },
    *   paired?: boolean, log?: (m: string, f?: Record<string, any>) => void, now?: () => number,
    *   permTtlMs?: number, pollHoldMs?: number, sessDebounceMs?: number, host?: string,
-   *   onUnpaired?: (why: string) => void, awayMaxMs?: number }} o
+   *   onUnpaired?: (why: string) => void, awayMaxMs?: number,
+   *   voice?: { engine: import('./stt/utterance.js').Engine, ready: () => boolean } }} o
    */
   constructor(o) {
     this.relay = o.relay
@@ -42,6 +44,16 @@ export class Service {
     this.host = oneLine(o.host ?? os.hostname(), 60)
     this.onUnpaired = o.onUnpaired || (() => {})
     this.away = new AwayMode({ now: this.now, maxMs: o.awayMaxMs, onChange: (on, why) => this.onAwayChange(on, why) })
+    this.voiceReady = o.voice ? o.voice.ready : () => false
+    // E3: spoken instructions. Without a voice engine every utterance is answered `no_stt`.
+    this.voice = new Utterances({
+      engine: o.voice ? o.voice.engine : { createVad() { throw new Error('no_stt') }, recognize: () => Promise.reject(new Error('no_stt')), load: () => Promise.reject(new Error('no_stt')) },
+      send: (ev, payload) => this.send(ev, payload),
+      awayOn: () => this.away.isOn(),
+      hasSession: (sid) => !!this.sessions.get(sid),
+      ready: () => this.voiceReady(),
+      log: this.log, now: this.now,
+    })
     this.perms = new PermTable({ now: this.now })
     this.sessions = new SessionTable({ now: this.now })
     /** @type {Map<string, { resolve: (a: HookAnswer) => void, timer: any }>} */
@@ -70,14 +82,16 @@ export class Service {
   /** @param {string} ev @param {unknown} [payload] */
   send(ev, payload) {
     if (!this.relay.connected) return false
-    const meta = ev === 'hello' || ev === 'away' || ev === 'unpair'
+    // An `stt` that is only an error (no text) says nothing about the agents, so the screen may learn `away_off` (E3).
+    const sttErr = ev === 'stt' && !!payload && typeof payload === 'object' && /** @type {any} */ (payload).text === '' && typeof /** @type {any} */ (payload).err === 'string'
+    const meta = ev === 'hello' || ev === 'away' || ev === 'unpair' || sttErr
     if (!meta && !this.away.isOn()) return false
     this.relay.emit(ev, payload)
     return true
   }
 
   hello() {
-    this.send('hello', { v: PROTOCOL_V, host: this.host, agents: ['claude'], away: this.away.isOn() })
+    this.send('hello', { v: PROTOCOL_V, host: this.host, agents: ['claude'], away: this.away.isOn(), ...(this.voiceReady() ? { stt: true } : {}) })
   }
 
   /** @param {import('./sessions.js').Session} s */
@@ -341,7 +355,11 @@ export class Service {
       case 'disconnect':
         // N1: link lost = the relay forgets our requests; the hooks end empty at once
         this.releaseAll('link_lost')
+        this.voice.dropActive()
         return
+      case 'audio_start': this.voice.onStart(payload); return
+      case 'audio': this.voice.onAudio(payload); return
+      case 'audio_end': this.voice.onEnd(payload); return
       case 'decide': {
         const r = this.perms.decide(payload, { away: this.away.isOn() })
         if (!r.ok) {
@@ -427,6 +445,7 @@ export class Service {
     } else {
       // N5/D11: release every waiting hook, drop queued commands and whatever came from the agents' output
       this.releaseAll('away_off')
+      this.voice.abortAll('away_off')
       this.cmds.clear()
       this.dirty.clear()
       this.sessions.forgetContent()
@@ -463,10 +482,18 @@ export class Service {
         modAgoMs: s.modSeenAt ? this.now() - s.modSeenAt : null, interactive: s.interactive,
       })),
       perms: this.perms.list().length,
+      voice: { ready: this.voiceReady(), busy: !!this.voice.active },
     }
   }
 
+  /** The voice was installed or removed while running: tell the relay again (the contract allows a repeated `hello`). */
+  voiceChanged() {
+    this.hello()
+    return { ok: true, stt: this.voiceReady() }
+  }
+
   stop() {
+    this.voice.dropActive()
     this.releaseAll('stopping')
     this.wake()
     if (this.flushTimer) clearTimeout(this.flushTimer)

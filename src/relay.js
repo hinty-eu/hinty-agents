@@ -4,7 +4,7 @@
 import { EventEmitter } from 'node:events'
 import { io as ioDefault } from 'socket.io-client'
 
-const SERVER_EVENTS = ['ready', 'decide', 'say', 'away', 'want', 'perm_refused', 'unpaired', 'denied']
+const SERVER_EVENTS = ['ready', 'decide', 'say', 'away', 'want', 'perm_refused', 'unpaired', 'denied', 'audio_start', 'audio', 'audio_end']
 
 export class Relay extends EventEmitter {
   /**

@@ -8,6 +8,8 @@ import * as claude from './adapters/claude.js'
 import { prettyCode, pair } from './pair.js'
 import { Relay } from './relay.js'
 import { DEFAULT_API, cliEntry, ensureHome, isPaired, paths, pidAlive, readConfig, readDaemonInfo, updateConfig } from './store.js'
+import { MODELS } from './stt/models.js'
+import { fmtMB, installVoice, removeVoice, voiceStatus } from './stt/install.js'
 import { VERSION } from './version.js'
 
 const sleep = (/** @type {number} */ ms) => new Promise((r) => setTimeout(r, ms))
@@ -33,6 +35,8 @@ Usage: npx hinty-agents [command]
   doctor              check Node, Claude Code, the plugin, the service and the link
   unpair              disconnect this computer from your Hinty account
   start | stop        start or stop the background service
+  voice install       local speech to text for dictating to agents from the glasses (free, ~0.7 GB: --model <id>)
+  voice status|remove show what is installed / delete the voice packages and models
 
 Setup options: --no-install (skip the plugin), --no-start (do not start the service), --label <name>
 Server: ${DEFAULT_API} (override with HINTY_AGENTS_API). Data: ~/.hinty-agents (override with HINTY_AGENTS_HOME).`
@@ -57,6 +61,7 @@ export async function main(argv) {
     case 'unpair': return unpair()
     case 'start': return start()
     case 'stop': return stop()
+    case 'voice': return voice(rest)
     case '-v':
     case '--version':
     case 'version':
@@ -216,11 +221,57 @@ async function showStatus() {
   out(`Link:     ${s.relay.connected ? c.ok('connected') : c.warn(`not connected${s.relay.lastError ? ` (${s.relay.lastError})` : ''}`)}`)
   out(`Away:     ${s.away.on ? c.ok(`ON until ${new Date(s.away.until).toLocaleTimeString()}`) : 'off (nothing leaves this computer)'}`)
   out(`Waiting:  ${s.perms} permission request(s)`)
+  if (s.voice) out(`Voice:    ${s.voice.ready ? c.ok('ready') : 'not installed (npx hinty-agents voice install)'}`)
   out(`Sessions: ${s.sessions.length ? '' : 'none'}`)
   for (const x of s.sessions) {
     out(`  ${x.label.padEnd(24)} ${x.agent.padEnd(7)} ${x.st.padEnd(5)} ${x.mod ? 'mod ok' : c.warn('no mod contact')}`)
   }
   return 0
+}
+
+/** @param {string[]} args */
+async function voice(args) {
+  const [sub, ...rest] = args
+  const mi = rest.indexOf('--model')
+  const model = mi >= 0 ? rest[mi + 1] : undefined
+  if (sub === 'install') {
+    try {
+      await installVoice({ model, out })
+    } catch (e) {
+      out(c.bad(`Voice install failed: ${/** @type {Error} */ (e).message}`))
+      return 1
+    }
+    await tellService()
+    return 0
+  }
+  if (sub === 'status') {
+    const v = voiceStatus()
+    out(c.b('Voice (local speech to text)'))
+    out(`Ready:    ${v.ready ? c.ok('yes') : c.warn('no')}${v.model ? ` (model ${v.model})` : ''}`)
+    out(`Engine:   ${v.sherpa ? `sherpa-onnx-node ${v.sherpa} (${fmtMB(v.sherpaOnDisk)} on disk)` : 'not installed'}`)
+    for (const m of v.models) out(`  ${m.id.padEnd(14)} ${m.installed ? c.ok('installed') : 'not installed'}  ${m.installed ? fmtMB(m.sizeOnDisk) + ' on disk' : 'download ' + fmtMB(m.download)}`)
+    if (!v.ready) out(`Install:  npx hinty-agents voice install   (models: ${Object.keys(MODELS).filter((k) => MODELS[k].kind !== 'vad').join(', ')})`)
+    return 0
+  }
+  if (sub === 'remove') {
+    const freed = removeVoice()
+    out(`${c.ok('✓')} Voice removed (${fmtMB(freed)} freed).`)
+    await tellService()
+    return 0
+  }
+  out('Usage: npx hinty-agents voice install [--model parakeet-v3|whisper-small|whisper-turbo] | status | remove')
+  return 1
+}
+
+/** After installing or removing the voice: a running service says `hello` again (with or without `stt`). */
+async function tellService() {
+  if (!readDaemonInfo()) return
+  try {
+    const r = await call('POST', '/v1/voice/reload')
+    out(`${c.ok('✓')} The running service was told (speech ${r && r.stt ? 'on' : 'off'}).`)
+  } catch {
+    out(c.warn('The service did not answer; restart it: npx hinty-agents stop && npx hinty-agents start'))
+  }
 }
 
 /** @param {string | undefined} arg */
