@@ -1,0 +1,29 @@
+{
+  "name": "hinty-agents",
+  "version": "0.1.0",
+  "description": "Supervise your AI coding agents (Claude Code first) from Hinty smart-glasses and the Hinty web panel: approve or deny permission prompts, see session status, send follow-up instructions.",
+  "type": "module",
+  "bin": {
+    "hinty-agents": "bin/hinty-agents.js"
+  },
+  "files": [
+    "bin/",
+    "src/",
+    "claude-plugin/",
+    ".claude-plugin/",
+    "README.md",
+    "LICENSE"
+  ],
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "test": "node --test \"test/*.test.js\"",
+    "start": "node bin/hinty-agents.js"
+  },
+  "dependencies": {
+    "socket.io-client": "^4.8.3"
+  },
+  "license": "MIT",
+  "private": true
+}

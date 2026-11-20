@@ -1,0 +1,109 @@
+// @ts-check
+// The background service (one per computer): relay connection + local HTTP port for the hook and the mod.
+// Started by `hinty-agents start` (or the wizard, or the SessionStart hook after a reboot); stopped by `hinty-agents stop`.
+import fs from 'node:fs'
+import { newSecret } from './crypto.js'
+import { createLocalServer, listenLoopback } from './local-http.js'
+import { createLog } from './log.js'
+import { Relay } from './relay.js'
+import { Service } from './service.js'
+import { ensureHome, isPaired, paths, pidAlive, readConfig, readJson, updateConfig, writeJson } from './store.js'
+import { VERSION } from './version.js'
+
+/** Single instance per computer: an exclusive lock file with our pid (a stale one is taken over). */
+function takeLock() {
+  const { lock } = paths()
+  for (let i = 0; i < 2; i++) {
+    try {
+      fs.writeFileSync(lock, String(process.pid), { flag: 'wx', mode: 0o600 })
+      return true
+    } catch (e) {
+      if (/** @type {any} */ (e).code !== 'EEXIST') throw e
+      const other = Number(fs.readFileSync(lock, 'utf8').trim())
+      if (other !== process.pid && pidAlive(other)) return false
+      try { fs.unlinkSync(lock) } catch { /* raced */ }
+    }
+  }
+  return false
+}
+
+export async function runDaemon() {
+  ensureHome()
+  const p = paths()
+  const log = createLog(p.log)
+  const config = readConfig()
+  if (!isPaired(config) || !config) {
+    log('not_paired')
+    console.error('hinty-agents: this computer is not paired yet (run: npx hinty-agents)')
+    process.exitCode = 1
+    return
+  }
+  if (!takeLock()) {
+    console.error('hinty-agents: the service is already running')
+    return
+  }
+  const secret = newSecret()
+  const relay = new Relay({ api: config.api, token: /** @type {string} */ (config.bridgeToken), log })
+  let stopping = false
+
+  const service = new Service({
+    relay: { get connected() { return relay.connected }, emit: (ev, payload) => relay.send(ev, payload) },
+    log,
+    onUnpaired: (why) => {
+      log('unpaired', { why })
+      updateConfig({ bridgeToken: undefined, bridgeId: undefined })
+      void shutdown(0)
+    },
+  })
+  relay.on('relay', (ev, payload) => service.onRelay(ev, payload))
+
+  const server = createLocalServer({
+    secret,
+    log,
+    routes: {
+      'GET /v1/ping': () => ({ ok: true, v: 1, version: VERSION }),
+      'GET /v1/status': () => ({ ...service.status(), version: VERSION, api: config.api, label: config.label || null, bridgeId: config.bridgeId || null }),
+      'POST /v1/hook/permission': (body, ctl) => service.hookPermission(body, ctl),
+      'POST /v1/hook/session-start': (body) => service.hookSessionStart(body),
+      'POST /v1/mod/poll': (body, ctl) => service.modPoll(body, ctl),
+      'POST /v1/mod/event': (body) => service.modEvent(body),
+      'POST /v1/mod/ack': (body) => service.modAck(body),
+      'POST /v1/away': (body) => (body && typeof body.on === 'boolean' ? service.setAway(body.on, 'cli') : { error: 'invalid' }),
+      'POST /v1/stop': () => { setTimeout(() => void shutdown(0), 50); return { ok: true } },
+      'POST /v1/unpair': () => {
+        relay.send('unpair')
+        updateConfig({ bridgeToken: undefined, bridgeId: undefined })
+        setTimeout(() => void shutdown(0), 500)
+        return { ok: true }
+      },
+    },
+  })
+  const port = await listenLoopback(server)
+  writeJson(p.daemon, { v: 1, pid: process.pid, port, secret, startedAt: new Date().toISOString(), version: VERSION })
+  log('start', { pid: process.pid, port, v: VERSION })
+
+  const ticker = setInterval(() => service.tick(), 5000)
+  relay.start()
+
+  /** @param {number} code */
+  async function shutdown(code) {
+    if (stopping) return
+    stopping = true
+    log('stop', { code })
+    clearInterval(ticker)
+    service.stop()
+    relay.stop()
+    server.close()
+    server.closeAllConnections?.()
+    const d = readJson(p.daemon)
+    if (d && d.pid === process.pid) { try { fs.unlinkSync(p.daemon) } catch { /* gone */ } }
+    try { if (Number(fs.readFileSync(p.lock, 'utf8')) === process.pid) fs.unlinkSync(p.lock) } catch { /* gone */ }
+    setTimeout(() => process.exit(code), 100).unref()
+  }
+
+  process.on('SIGINT', () => void shutdown(0))
+  process.on('SIGTERM', () => void shutdown(0))
+  process.on('SIGHUP', () => void shutdown(0))
+  process.on('uncaughtException', (e) => { log('crash', { err: e?.name || 'error' }); void shutdown(1) })
+  process.on('unhandledRejection', (e) => { log('crash', { err: /** @type {any} */ (e)?.name || 'rejection' }); void shutdown(1) })
+}

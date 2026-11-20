@@ -1,0 +1,12 @@
+{
+  "description": "Hinty Agents: PermissionRequest and SessionStart hooks (exec form) and a mod for session status and follow-up instructions",
+  "modules": ["./register.mjs"],
+  "hooks": {
+    "PermissionRequest": [
+      { "hooks": [ { "type": "command", "command": "node", "args": ["${CLAUDE_PLUGIN_ROOT}/hook.cjs", "PermissionRequest"], "timeout": 900 } ] }
+    ],
+    "SessionStart": [
+      { "hooks": [ { "type": "command", "command": "node", "args": ["${CLAUDE_PLUGIN_ROOT}/hook.cjs", "SessionStart"], "timeout": 10 } ] }
+    ]
+  }
+}

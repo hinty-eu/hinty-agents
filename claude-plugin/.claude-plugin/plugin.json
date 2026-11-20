@@ -1,0 +1,16 @@
+{
+  "name": "hinty-agents",
+  "version": "0.1.0",
+  "description": "Hinty Agents: answer Claude Code permission prompts and follow your sessions from Hinty smart-glasses or the Hinty web panel while you are away from the desk.",
+  "author": {
+    "name": "Hinty",
+    "url": "https://hinty.eu"
+  },
+  "homepage": "https://hinty.eu",
+  "license": "MIT",
+  "network": {
+    "hosts": [
+      "127.0.0.1"
+    ]
+  }
+}

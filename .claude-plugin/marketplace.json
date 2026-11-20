@@ -1,0 +1,13 @@
+{
+  "name": "hinty-agents",
+  "owner": { "name": "Hinty", "url": "https://hinty.eu" },
+  "description": "Hinty Agents for Claude Code: permission prompts and session status on Hinty smart-glasses and the Hinty panel.",
+  "plugins": [
+    {
+      "name": "hinty-agents",
+      "source": "./claude-plugin",
+      "description": "Answer Claude Code permission prompts and follow sessions from Hinty smart-glasses or the Hinty web panel.",
+      "version": "0.1.0"
+    }
+  ]
+}
