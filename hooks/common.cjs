@@ -27,10 +27,27 @@ function readJson(file) {
   try { return JSON.parse(fs.readFileSync(file, 'utf8')) } catch (e) { return null }
 }
 
+function pidAlive(pid) {
+  try { process.kill(pid, 0); return true } catch (e) { return e.code === 'EPERM' }
+}
+
+// daemon.json of a LIVE service of this protocol, else null (a dead service's port may belong to anybody now)
 function daemonInfo(dir) {
   const d = readJson(require('path').join(dir, 'daemon.json'))
   if (!d || d.pv !== PV || !Number.isInteger(d.port) || d.port <= 0 || d.port > 65535 || typeof d.key !== 'string' || d.key.length < 32) return null
+  if (!Number.isInteger(d.pid) || d.pid <= 0 || !pidAlive(d.pid)) return null
   return d
+}
+
+// Security review 2, Z6: nothing with content goes to the port before the service has proved itself with a signed
+// answer to /v1/ping carrying the pid from daemon.json; an unsigned or missing answer ends the hook within `ms`.
+function verified(d, ms, cb) {
+  request(d, 'GET', '/v1/ping', '', ms, (ans) => cb(!!ans && ans.ok === true && ans.pid === d.pid))
+}
+
+// verified first, then one signed request with content; cb(null) when the service did not prove itself
+function send(d, method, path, body, pingMs, timeoutMs, cb) {
+  verified(d, pingMs, (ok) => { if (!ok) return cb(null); request(d, method, path, body, timeoutMs, cb) })
 }
 
 // One signed request to the service. cb(answer) with the parsed JSON, or cb(null) on any failure (N1).
@@ -100,4 +117,4 @@ function readStdin() {
   try { return fs.readFileSync(0, 'utf8') } catch (e) { return '' }
 }
 
-module.exports = { PV, CONTEXT, home, readJson, daemonInfo, request, autostart, validEntry, readStdin, isAbs }
+module.exports = { PV, CONTEXT, home, readJson, daemonInfo, request, verified, send, autostart, validEntry, readStdin, isAbs }

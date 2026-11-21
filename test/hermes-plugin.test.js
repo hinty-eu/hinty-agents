@@ -46,6 +46,7 @@ async function bridge({ away = true, writeSecret } = {}) {
   const server = createLocalServer({
     key: secret,
     routes: {
+      'GET /v1/ping': () => ({ ok: true, v: 2, pid: process.pid }),
       'POST /v1/hermes/perm': (b, c) => link.perm(b, c),
       'POST /v1/hermes/event': (b) => link.event(b),
       'POST /v1/hermes/poll': (b, c) => link.poll(b, c),

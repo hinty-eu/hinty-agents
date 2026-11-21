@@ -10,15 +10,23 @@
 //  N1  we never answer on our own: no answer from the glasses = no answer sent; OpenClaw then applies `askFallback`
 //      (default: deny) or another window of the person decides;
 //  N2  the ONLY decisions we ever send are `allow-once` and `deny` (see `decisionFor`);
-//  N12 a `say` text is a plain message: `safeInstruction` plus a zero-width space before every `/` or `!` that follows
-//      white space (OpenClaw runs `/approve <id> allow-always`, `/exec ...`, `! cmd` from chat text, also inline).
+//  N12 a `say` text is a plain message, three times over (security review 2, Z1):
+//      1. it is sent over a SECOND connection that has no `operator.approvals` (OpenClaw refuses `/approve` from such a
+//         client, however the text is dressed up), with its own device token; the approvals connection never sends chat;
+//      2. it starts with a fixed line (CHAT_PREAMBLE) that OpenClaw's own clean-up (stripStructuralPrefixes: `[...]`
+//         removed, `label:` at a line start removed, `\n` written out as text = a space) can never remove, so the
+//         message never starts with `/` or `!`;
+//      3. `disarm`: a zero-width space before every `/` or `!` that follows the start, white space, `]`, `:` or a written
+//         out `\n`, and OpenClaw's "current message" marker broken up.
+//  Z5  the card shows every field of the request that changes what runs (argv, preview, env keys, resolved path,
+//      policy); env values are never sent to us, and a field we do not know, so such a card is incomplete (`part`).
 import crypto from 'node:crypto'
 import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
 import { homeDir, writeJson, readJson } from '../store.js'
 import { glassesLine, oneLine, safeInstruction } from '../text.js'
-import { GatewayClient, loadIdentity, SCOPES } from './openclaw-client.js'
+import { APPROVER_SCOPES, GatewayClient, WRITER_SCOPES, loadIdentity, newIdentity, saveIdentity } from './openclaw-client.js'
 import { resolveProgram, runSync } from '../exec.js'
 
 export const id = 'openclaw'
@@ -28,8 +36,13 @@ const ACTIVE_MS = 30 * 60 * 1000
 const DEFAULT_PORT = 18789
 
 export const dir = () => path.join(homeDir(), 'openclaw')
-export const identityFile = () => path.join(dir(), 'device.json')
-export const tokenFile = () => path.join(dir(), 'token.json')
+/** 0.3.0: two device identities, each with its own token (Z1) */
+export const approverFile = () => path.join(dir(), 'approver.json')
+export const writerFile = () => path.join(dir(), 'writer.json')
+export const tokensFile = () => path.join(dir(), 'tokens.json')
+/** 0.2.x: one identity whose token had every scope; never used again, `install openclaw` replaces it */
+export const legacyIdentityFile = () => path.join(dir(), 'device.json')
+export const legacyTokenFile = () => path.join(dir(), 'token.json')
 
 /** @returns {{ found: boolean, version: string | null }} */
 export function detect() {
@@ -127,17 +140,52 @@ export function askFallbackFull() {
 // install / uninstall / doctor
 // ------------------------------------------------------------------------------------------------
 
-/** @returns {{ installed: boolean, deviceId?: string, url?: string, scopes?: string[] }} */
+/** @param {unknown} v @returns {string[]} */
+const scopeList = (v) => (Array.isArray(v) ? v.filter((x) => typeof x === 'string') : [])
+
+/**
+ * The stored pairing (tokens.json v2 + the two identities), or null. A writer that has `operator.approvals` is never
+ * accepted (Z1: chat text must not come from a client that can approve).
+ * @returns {{ url: string, protocol: number, approver: { identity: import('./openclaw-client.js').Identity, deviceToken: string, scopes: string[] },
+ *   writer: { identity: import('./openclaw-client.js').Identity, deviceToken: string, scopes: string[] } | null } | null}
+ */
+export function readPairing() {
+  const t = /** @type {any} */ (readJson(tokensFile()))
+  const a = loadIdentity(approverFile(), { create: false })
+  if (!t || t.v !== 2 || typeof t.url !== 'string' || !a || !t.approver || typeof t.approver.deviceToken !== 'string' || t.approver.deviceId !== a.deviceId) return null
+  const w = loadIdentity(writerFile(), { create: false })
+  const ws = t.writer && scopeList(t.writer.scopes)
+  const writer = w && t.writer && typeof t.writer.deviceToken === 'string' && t.writer.deviceId === w.deviceId &&
+    ws && ws.includes('operator.write') && !ws.includes('operator.approvals')
+    ? { identity: w, deviceToken: t.writer.deviceToken, scopes: ws } : null
+  return { url: t.url, protocol: Number(t.protocol) || 0, approver: { identity: a, deviceToken: t.approver.deviceToken, scopes: scopeList(t.approver.scopes) }, writer }
+}
+
+/** @returns {{ installed: boolean, deviceId?: string, writerId?: string, url?: string, canWrite?: boolean, legacy?: string }} */
 export function installed() {
-  const t = readJson(tokenFile())
-  const idn = loadIdentity(identityFile(), { create: false })
-  if (!t || !idn || typeof t.deviceToken !== 'string') return { installed: false }
-  return { installed: true, deviceId: idn.deviceId, url: t.url, scopes: t.scopes }
+  const p = readPairing()
+  if (!p) {
+    // a 0.2.x pairing: one token with every scope; it is not used any more (`install openclaw` again)
+    const old = loadIdentity(legacyIdentityFile(), { create: false })
+    return { installed: false, ...(old && fs.existsSync(legacyTokenFile()) ? { legacy: old.deviceId } : {}) }
+  }
+  return { installed: true, deviceId: p.approver.identity.deviceId, writerId: p.writer?.identity.deviceId, url: p.url, canWrite: !!p.writer }
+}
+
+/** Device ids this computer paired before (to tell the person which ones to remove from the Gateway). */
+function previousDevices() {
+  const ids = []
+  for (const f of [legacyIdentityFile(), approverFile(), writerFile()]) {
+    const i = loadIdentity(f, { create: false })
+    if (i) ids.push(i.deviceId)
+  }
+  return ids
 }
 
 /**
- * Pair once with the Gateway (the first loopback connection pairs by itself) and keep the device token.
- * The shared Gateway token is used for this one connection only and is not stored anywhere.
+ * Pair two devices with the Gateway (the first loopback connection pairs by itself): `approver` (read + approvals) and
+ * `writer` (read + write), each with its own device token (Z1). The shared Gateway token is used for these two
+ * connections only and is not stored anywhere. A 0.2.x pairing (one token with every scope) is replaced.
  * @param {{ tokenFile?: string, url?: string, WebSocketImpl?: any }} [o]
  * @returns {Promise<{ ok: boolean, steps: Array<{ step: string, ok: boolean, message: string }> }>}
  */
@@ -154,28 +202,61 @@ export async function install(o = {}) {
     steps.push({ step: 'token', ok: false, message: `no Gateway token found in ${configPath()} (or OPENCLAW_GATEWAY_TOKEN); pass --token-file <file>` })
     return { ok: false, steps }
   }
-  const identity = /** @type {import('./openclaw-client.js').Identity} */ (loadIdentity(identityFile()))
-  const client = new GatewayClient({ url, identity, token: info.token, scopes: SCOPES, WebSocketImpl: o.WebSocketImpl })
+  const before = previousDevices()
+  /**
+   * @param {string[]} scopes @param {number[]} [protocols]
+   * @returns {Promise<{ identity: import('./openclaw-client.js').Identity, deviceToken: string, scopes: string[], protocol: number, version: string }>}
+   */
+  const pairOne = async (scopes, protocols) => {
+    const identity = newIdentity()
+    const client = new GatewayClient({ url, identity, token: /** @type {string} */ (info.token), scopes, protocols, WebSocketImpl: o.WebSocketImpl })
+    try {
+      const hello = await client.connect()
+      const a = hello && hello.auth
+      if (!a || typeof a.deviceToken !== 'string') throw Object.assign(new Error('the Gateway did not issue a device token'), { code: 'NO_TOKEN' })
+      return { identity, deviceToken: a.deviceToken, scopes: Array.isArray(a.scopes) ? scopeList(a.scopes) : scopes, protocol: client.protocol, version: String(hello.server && hello.server.version || '?') }
+    } finally { client.close() }
+  }
+  /** @type {Awaited<ReturnType<typeof pairOne>>} */
+  let approver
+  /** @type {Awaited<ReturnType<typeof pairOne>> | null} */
+  let writer = null
   try {
-    const hello = await client.connect()
-    const a = hello && hello.auth
-    if (!a || typeof a.deviceToken !== 'string') {
-      steps.push({ step: 'pairing', ok: false, message: 'the Gateway did not issue a device token' })
+    approver = await pairOne(APPROVER_SCOPES)
+    if (!approver.scopes.includes('operator.approvals')) {
+      steps.push({ step: 'pairing', ok: false, message: 'the Gateway did not grant operator.approvals: approval prompts cannot reach the glasses' })
       return { ok: false, steps }
     }
-    const scopes = Array.isArray(a.scopes) ? a.scopes : SCOPES
-    writeJson(tokenFile(), { v: 1, url, deviceToken: a.deviceToken, scopes, protocol: client.protocol, issuedAtMs: a.issuedAtMs || Date.now() })
-    steps.push({ step: 'pairing', ok: true, message: `device ${identity.deviceId.slice(0, 12)}... paired (protocol ${client.protocol}, OpenClaw ${hello.server && hello.server.version || '?'})` })
-    steps.push({ step: 'token', ok: true, message: `device token stored in ${tokenFile()} (readable by you only; it can write to your sessions, so it never leaves this computer)` })
-    if (!scopes.includes('operator.write')) steps.push({ step: 'scopes', ok: true, message: 'without operator.write the glasses cannot send instructions to OpenClaw sessions' })
+    steps.push({ step: 'pairing', ok: true, message: `approvals device ${approver.identity.deviceId.slice(0, 12)}... paired (${approver.scopes.join(', ')}; protocol ${approver.protocol}, OpenClaw ${approver.version})` })
+    const w = await pairOne(WRITER_SCOPES, [approver.protocol])
+    if (w.scopes.includes('operator.approvals')) {
+      steps.push({ step: 'instructions', ok: true, message: 'the Gateway gave the instructions device operator.approvals as well, so it is NOT used: instructions from the glasses are off for OpenClaw' })
+    } else if (!w.scopes.includes('operator.write')) {
+      steps.push({ step: 'instructions', ok: true, message: 'without operator.write the glasses cannot send instructions to OpenClaw sessions' })
+    } else {
+      writer = w
+      steps.push({ step: 'pairing', ok: true, message: `instructions device ${w.identity.deviceId.slice(0, 12)}... paired (${w.scopes.join(', ')}; no operator.approvals, so a message can never approve anything)` })
+    }
   } catch (e) {
     const err = /** @type {any} */ (e)
     const hint = err.code === 'PAIRING_REQUIRED' ? ' (a remote Gateway needs `openclaw devices approve <requestId>`)'
       : err.code === 'AUTH_TOKEN_MISMATCH' ? ' (wrong Gateway token)' : ''
     steps.push({ step: 'pairing', ok: false, message: `${err.message}${hint}; is the Gateway running? (openclaw gateway)` })
     return { ok: false, steps }
-  } finally {
-    client.close()
+  }
+  saveIdentity(approverFile(), approver.identity)
+  if (writer) saveIdentity(writerFile(), writer.identity)
+  else { try { fs.unlinkSync(writerFile()) } catch { /* none */ } }
+  writeJson(tokensFile(), {
+    v: 2, url, protocol: approver.protocol,
+    approver: { deviceId: approver.identity.deviceId, deviceToken: approver.deviceToken, scopes: approver.scopes, issuedAtMs: Date.now() },
+    writer: writer ? { deviceId: writer.identity.deviceId, deviceToken: writer.deviceToken, scopes: writer.scopes, issuedAtMs: Date.now() } : null,
+  })
+  for (const f of [legacyIdentityFile(), legacyTokenFile()]) { try { fs.unlinkSync(f) } catch { /* none */ } }
+  steps.push({ step: 'token', ok: true, message: `device tokens stored in ${tokensFile()} (readable by you only; they never leave this computer)` })
+  const now = new Set([approver.identity.deviceId, writer?.identity.deviceId])
+  for (const old of before.filter((x) => !now.has(x))) {
+    steps.push({ step: 'old device', ok: true, message: `an earlier pairing of this bridge is no longer used; revoke it: openclaw devices remove ${old}` })
   }
   for (const f of askFallbackFull()) steps.push({ step: 'WARNING', ok: true, message: `${f} has askFallback: full - OpenClaw then allows by itself when nobody answers in time. Set it to deny (OpenClaw's default) to keep "no answer = no".` })
   steps.push({ step: 'config', ok: true, message: 'nothing in your OpenClaw configuration was changed; the bridge connects only while away mode is on' })
@@ -184,11 +265,11 @@ export async function install(o = {}) {
 
 /** @returns {{ ok: boolean, steps: Array<{ step: string, ok: boolean, message: string }> }} */
 export function uninstall() {
-  const idn = loadIdentity(identityFile(), { create: false })
+  const ids = previousDevices()
   if (!fs.existsSync(dir())) return { ok: true, steps: [{ step: 'openclaw', ok: true, message: 'nothing to remove' }] }
   fs.rmSync(dir(), { recursive: true, force: true })
-  const steps = [{ step: 'files', ok: true, message: `removed ${dir()} (device key and token)` }]
-  if (idn) steps.push({ step: 'device', ok: true, message: `the Gateway still lists this device; to revoke it: openclaw devices remove ${idn.deviceId}` })
+  const steps = [{ step: 'files', ok: true, message: `removed ${dir()} (device keys and tokens)` }]
+  for (const id of ids) steps.push({ step: 'device', ok: true, message: `the Gateway still lists this device; to revoke it: openclaw devices remove ${id}` })
   return { ok: true, steps }
 }
 
@@ -197,16 +278,22 @@ export async function doctor() {
   /** @type {Array<{ ok: boolean | null, text: string, hint?: string }>} */
   const out = []
   const inst = installed()
-  if (!inst.installed) return [{ ok: null, text: 'OpenClaw: bridge not paired with the Gateway', hint: 'npx hinty-agents install openclaw' }]
-  const t = /** @type {any} */ (readJson(tokenFile()))
-  const idn = /** @type {import('./openclaw-client.js').Identity} */ (loadIdentity(identityFile(), { create: false }))
-  const c = new GatewayClient({ url: t.url, identity: idn, deviceToken: t.deviceToken, scopes: SCOPES, connectTimeoutMs: 5000 })
-  try {
-    await c.connect()
-    out.push({ ok: true, text: `OpenClaw Gateway reachable at ${t.url}, protocol ${c.protocol}, device token accepted` })
-  } catch (e) {
-    out.push({ ok: false, text: `OpenClaw Gateway: ${/** @type {Error} */ (e).message}`, hint: 'is it running (openclaw gateway)? token refused: npx hinty-agents install openclaw' })
-  } finally { c.close() }
+  if (!inst.installed) {
+    return [inst.legacy
+      ? { ok: false, text: 'OpenClaw: paired by an older version with ONE token that can both approve and send messages; it is not used any more', hint: 'npx hinty-agents install openclaw' }
+      : { ok: null, text: 'OpenClaw: bridge not paired with the Gateway', hint: 'npx hinty-agents install openclaw' }]
+  }
+  const p = /** @type {NonNullable<ReturnType<typeof readPairing>>} */ (readPairing())
+  for (const [name, part, scopes] of /** @type {const} */ ([['approvals', p.approver, APPROVER_SCOPES], ['instructions', p.writer, WRITER_SCOPES]])) {
+    if (!part) { out.push({ ok: null, text: 'OpenClaw instructions device: not paired (messages from the glasses are off for OpenClaw)', hint: 'npx hinty-agents install openclaw' }); continue }
+    const c = new GatewayClient({ url: p.url, identity: part.identity, deviceToken: part.deviceToken, scopes: [...scopes], connectTimeoutMs: 5000 })
+    try {
+      await c.connect()
+      out.push({ ok: true, text: `OpenClaw Gateway at ${p.url}: ${name} device accepted (protocol ${c.protocol}, ${part.scopes.join(', ')})` })
+    } catch (e) {
+      out.push({ ok: false, text: `OpenClaw Gateway (${name} device): ${/** @type {Error} */ (e).message}`, hint: 'is it running (openclaw gateway)? token refused: npx hinty-agents install openclaw' })
+    } finally { c.close() }
+  }
   for (const f of askFallbackFull()) out.push({ ok: null, text: `${f}: askFallback is "full" - OpenClaw allows by itself when nobody answers`, hint: 'set it to deny' })
   return out
 }
@@ -222,10 +309,83 @@ export async function doctor() {
 export const decisionFor = (d) => (d === 'allow' ? 'allow-once' : 'deny')
 
 /**
- * Text for chat.send: plain message (safeInstruction) and no `/` or `!` after white space either (inline directives).
+ * The fixed first line of every message we send with chat.send (Z1). OpenClaw looks for a command at the start of the
+ * message AFTER its own clean-up (stripStructuralPrefixes in OpenClaw 2026.3: `[...]` removed, `label:` at the start of a
+ * line removed, a written out `\n` = a space). This line starts with a letter, has no brackets, and has a comma before
+ * its colon (a comma is outside OpenClaw's label characters `[A-Za-z0-9+()\-_. ]`), so nothing of it is removed and the
+ * message never starts with `/` or `!`.
+ */
+export const CHAT_PREAMBLE = 'Message from the user, sent from Hinty (glasses or web panel):'
+
+/** OpenClaw drops everything before this marker (case-sensitive) before it looks for a command */
+const CURRENT_MARKER = /current message - respond to this/gi
+
+/**
+ * Text for chat.send: plain message (safeInstruction), and a zero-width space before every `/` or `!` that OpenClaw's
+ * clean-up could bring to the start of the message or after white space: after the start, white space, `]` (end of a
+ * removed `[...]`), `:` (end of a removed `label:`, but not `://` of a URL) or a written out `\n`. OpenClaw's "current
+ * message" marker is broken up. Idempotent enough: a zero-width space is never doubled before the same character.
  * @param {string} text
  */
-export const disarm = (text) => safeInstruction(text).replace(/(^|\s)([/!])/gu, '$1​$2')
+export const disarm = (text) => safeInstruction(text)
+  .replace(CURRENT_MARKER, (m) => `${m[0]}​${m.slice(1)}`)
+  .replace(/(^|\s|\]|\\n)([/!])|(:)(?!\/\/)([/!])/gu, (_m, a, b, c, d) => (a !== undefined ? `${a}​${b}` : `${c}​${d}`))
+
+/** The whole chat.send message: the fixed first line, then the disarmed text. @param {string} text */
+export const chatMessage = (text) => `${CHAT_PREAMBLE}\n${disarm(text)}`
+
+/** @param {unknown} v */
+const filled = (v) => v !== undefined && v !== null && v !== '' && !(Array.isArray(v) && v.length === 0)
+
+/** exec request fields that only say where the request came from (not what runs) */
+const EXEC_META = ['agentId', 'sessionKey', 'turnSourceChannel', 'turnSourceTo', 'turnSourceAccountId', 'turnSourceThreadId', 'systemRunBinding']
+const EXEC_SHOWN = ['command', 'commandPreview', 'commandArgv', 'envKeys', 'systemRunPlan', 'cwd', 'nodeId', 'host', 'security', 'ask', 'resolvedPath', 'warningText']
+const PLUGIN_META = ['agentId', 'sessionKey', 'turnSourceChannel', 'turnSourceTo', 'turnSourceAccountId', 'turnSourceThreadId', 'toolCallId']
+const PLUGIN_SHOWN = ['title', 'description', 'toolName', 'pluginId', 'severity']
+
+/**
+ * The card of an approval request (Z5): every field that changes what runs is on it. Incomplete (`part`) when the
+ * command is missing, a run plan we do not render is attached, environment overrides are set (OpenClaw sends only their
+ * names, never the values, so the card cannot show what they do), argv is not a list of strings, or the request has a
+ * field we do not know. Pure.
+ * @param {'exec' | 'plugin'} kind @param {Record<string, any>} req @param {string} tool
+ * @returns {{ text: string, complete: boolean }}
+ */
+export function approvalCard(kind, req, tool) {
+  const s = (/** @type {unknown} */ v) => (typeof v === 'string' ? v : '')
+  /** @param {string[]} known */
+  const unknown = (known) => Object.keys(req).filter((k) => !known.includes(k) && filled(req[k]))
+  const extra = (/** @type {string[]} */ keys) => (keys.length ? `\nother fields:\n${JSON.stringify(Object.fromEntries(keys.map((k) => [k, req[k]])), null, 2)}` : '')
+  if (kind === 'plugin') {
+    const other = unknown([...PLUGIN_SHOWN, ...PLUGIN_META])
+    const about = [s(req.pluginId) && `plugin: ${s(req.pluginId)}`, s(req.toolName) && `tool: ${s(req.toolName)}`, s(req.severity) && `severity: ${s(req.severity)}`].filter(Boolean).join(', ')
+    return { text: `${s(req.title) || tool}${s(req.description) ? `\n${s(req.description)}` : ''}${about ? `\n(${about})` : ''}${extra(other)}`, complete: !other.length }
+  }
+  let complete = true
+  const command = typeof req.command === 'string' ? req.command : null
+  if (command === null) complete = false
+  const lines = [command ?? '(command)']
+  const argv = req.commandArgv
+  if (filled(argv)) {
+    if (!Array.isArray(argv) || !argv.every((x) => typeof x === 'string')) { complete = false; lines.push(`argv: ${JSON.stringify(argv)}`) } else if (argv.join(' ') !== command) lines.push(`argv: ${JSON.stringify(argv)}`)
+  }
+  if (s(req.commandPreview).trim() && s(req.commandPreview).trim() !== (command || '').trim()) lines.push(`preview: ${s(req.commandPreview)}`)
+  if (filled(req.envKeys)) {
+    complete = false
+    lines.push(`env: ${Array.isArray(req.envKeys) ? req.envKeys.map((k) => String(k)).join(', ') : JSON.stringify(req.envKeys)} (values not shown)`)
+  }
+  if (s(req.resolvedPath)) lines.push(`runs: ${s(req.resolvedPath)}`)
+  if (s(req.cwd)) lines.push(`cwd: ${s(req.cwd)}`)
+  if (s(req.host) && req.host !== 'gateway') lines.push(`host: ${s(req.host)}`)
+  if (s(req.nodeId)) lines.push(`node: ${s(req.nodeId)}`)
+  const policy = [s(req.security) && `security=${s(req.security)}`, s(req.ask) && `ask=${s(req.ask)}`].filter(Boolean).join(' ')
+  if (policy) lines.push(`policy: ${policy}`)
+  if (filled(req.systemRunPlan)) { complete = false; lines.push('run plan: (not shown)') }
+  if (s(req.warningText)) lines.push(`! ${s(req.warningText)}`)
+  const other = unknown([...EXEC_SHOWN, ...EXEC_META])
+  if (other.length) complete = false
+  return { text: lines.join('\n') + extra(other), complete }
+}
 
 /** @param {unknown} content a message's `content`: a string or an array of {type:'text', text} @returns {string} */
 export function messageText(content) {
@@ -278,7 +438,12 @@ export class OpenClawLink {
     this.keys = new Map()
     /** approval id -> { rid, kind } */
     this.pending = new Map()
-    this.canWrite = true
+    this.canWrite = false
+    /** the instructions connection (no operator.approvals), opened at the first `say` while live (Z1) */
+    /** @type {GatewayClient | null} */
+    this.writer = null
+    /** @type {Promise<GatewayClient | null> | null} */
+    this.writerP = null
   }
 
   /** Connect (only if installed). Safe to call again. */
@@ -295,9 +460,46 @@ export class OpenClawLink {
     clearTimeout(this.retryTimer)
     this.dropPending('cancel')
     if (this.client) { const c = this.client; this.client = null; c.removeAllListeners(); c.close() }
+    this.closeWriter()
     this.keys.clear()
     this.byKey.clear()
     this.log('oc_stop')
+  }
+
+  closeWriter() {
+    const w = this.writer
+    this.writer = null
+    this.writerP = null
+    if (w) { w.removeAllListeners(); w.close() }
+  }
+
+  /**
+   * The connection for chat.send: the writer device (read + write, never approvals). Opened on demand while live,
+   * refused when the Gateway says it has `operator.approvals` after all. @returns {Promise<GatewayClient | null>}
+   */
+  writerClient() {
+    if (this.writer && this.writer.connected) return Promise.resolve(this.writer)
+    if (this.writerP) return this.writerP
+    const p = readPairing()
+    if (!p || !p.writer || !this.running) return Promise.resolve(null)
+    const gen = this.generation
+    const w = new GatewayClient({ url: p.url, identity: p.writer.identity, deviceToken: p.writer.deviceToken, scopes: [...WRITER_SCOPES], WebSocketImpl: this.WS, connectTimeoutMs: 10000, ...(p.protocol ? { protocols: [p.protocol] } : {}) })
+    w.on('close', () => { if (this.writer === w) { this.writer = null; this.writerP = null } })
+    this.writerP = w.connect().then((hello) => {
+      const granted = hello && hello.auth && Array.isArray(hello.auth.scopes) ? hello.auth.scopes : null
+      if (gen !== this.generation || !this.running || (granted && granted.includes('operator.approvals'))) {
+        if (granted && granted.includes('operator.approvals')) this.log('oc_writer_refused', { why: 'has_approvals' })
+        w.removeAllListeners(); w.close(); this.writerP = null
+        return null
+      }
+      this.writer = w
+      return w
+    }, (e) => {
+      this.log('oc_writer_failed', { err: /** @type {Error} */ (e)?.message?.slice(0, 60), code: /** @type {any} */ (e)?.code })
+      this.writerP = null
+      return null
+    })
+    return this.writerP
   }
 
   /** @param {string} why */
@@ -308,19 +510,18 @@ export class OpenClawLink {
 
   /** @param {number} gen */
   async open(gen) {
-    const t = /** @type {any} */ (readJson(tokenFile()))
-    const identity = loadIdentity(identityFile(), { create: false })
-    if (!t || !identity) { this.running = false; return }
-    const c = new GatewayClient({ url: t.url, identity, deviceToken: t.deviceToken, scopes: SCOPES, WebSocketImpl: this.WS })
+    const p = readPairing()
+    if (!p) { this.running = false; return }
+    // the approvals connection: read + approvals only; it never sends chat text (Z1)
+    const c = new GatewayClient({ url: p.url, identity: p.approver.identity, deviceToken: p.approver.deviceToken, scopes: [...APPROVER_SCOPES], WebSocketImpl: this.WS, ...(p.protocol ? { protocols: [p.protocol] } : {}) })
     this.client = c
     // listeners first: events can follow the hello frame immediately
     c.on('event', (f) => { try { this.onEvent(f) } catch (e) { this.log('oc_event_error', { err: /** @type {Error} */ (e)?.name }) } })
     c.on('close', () => { if (gen === this.generation && this.client === c) this.lost() })
     try {
-      const hello = await c.connect()
+      await c.connect()
       if (gen !== this.generation) { c.close(); return }
-      const scopes = (hello && hello.auth && hello.auth.scopes) || t.scopes || []
-      this.canWrite = scopes.includes('operator.write')
+      this.canWrite = !!p.writer
       this.log('oc_up', { protocol: c.protocol })
       await this.snapshot(c)
     } catch (e) {
@@ -389,15 +590,8 @@ export class OpenClawLink {
     const cwd = typeof req.cwd === 'string' ? req.cwd : ''
     const label = labelFor(sessionKey, typeof req.turnSourceChannel === 'string' ? req.turnSourceChannel : '')
     const tool = kind === 'exec' ? 'exec' : String(req.toolName || req.pluginId || 'plugin')
-    const command = typeof req.command === 'string' ? req.command : null
-    const host = typeof req.host === 'string' && req.host && req.host !== 'gateway' ? req.host : ''
-    const text = kind === 'exec'
-      ? `${command ?? '(command)'}${cwd ? `\ncwd: ${cwd}` : ''}${host ? `\nhost: ${host}` : ''}` +
-        `${typeof req.nodeId === 'string' && req.nodeId ? `\nnode: ${req.nodeId}` : ''}` +
-        `${typeof req.warningText === 'string' && req.warningText ? `\n! ${req.warningText}` : ''}`
-      : `${req.title || tool}${req.description ? `\n${req.description}` : ''}`
-    // an exec card is complete only when it shows the command itself and no run plan we do not render (point 3)
-    const complete = kind !== 'exec' || (command !== null && (req.systemRunPlan === null || req.systemRunPlan === undefined))
+    // every field that changes what runs is on the card, else the card is incomplete (point 3, review 2 Z5)
+    const { text, complete } = approvalCard(kind, req, tool)
     const entry = { rid: '', kind }
     this.pending.set(approvalId, entry)
     const answer = this.service.requestPerm(
@@ -519,13 +713,18 @@ export class OpenClawLink {
 
   // ---- commands from the glasses
 
-  /** @param {string} sid @param {string} text already `safeInstruction`ed by the service @returns {Promise<boolean>} */
+  /**
+   * An instruction from the glasses: chat.send over the WRITER connection (never the approvals one), with the fixed first
+   * line and the disarmed text (N12, Z1).
+   * @param {string} sid @param {string} text already `sayText`ed by the service @returns {Promise<boolean>}
+   */
   async say(sid, text) {
     const key = this.keys.get(sid)
-    const c = this.client
-    if (!key || !c || !c.connected || !this.canWrite) return false
+    if (!key || !this.client || !this.client.connected || !this.canWrite) return false
+    const w = await this.writerClient()
+    if (!w || !w.connected || w === this.client) return false
     try {
-      await c.request('chat.send', { sessionKey: key, message: disarm(text), idempotencyKey: crypto.randomUUID() }, 15000)
+      await w.request('chat.send', { sessionKey: key, message: chatMessage(text), idempotencyKey: crypto.randomUUID() }, 15000)
       return true
     } catch (e) {
       this.log('oc_say_failed', { err: /** @type {Error} */ (e).message.slice(0, 60) })

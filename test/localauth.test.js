@@ -155,9 +155,10 @@ function fakeEngine(home) {
 test('mod: signed requests to the real service, instructions submitted as plain text, remote switch-on shown; a squatter is ignored', async () => {
   const home = tmp()
   const relay = { connected: true, sent: [], emit(ev, p) { this.sent.push([ev, p]) } }
-  const service = new Service({ relay, sessDebounceMs: 0, remoteAwayAllowed: () => true })
+  const service = new Service({ relay, sessDebounceMs: 0, remoteAwayAllowed: () => true, remoteAwaySince: () => Date.now() })
   const key = newSecret()
   const server = createLocalServer({ key, routes: {
+    'GET /v1/ping': () => ({ ok: true, v: 2, pid: process.pid }),
     'POST /v1/mod/poll': (b, c) => service.modPoll(b, c),
     'POST /v1/mod/event': (b) => service.modEvent(b),
     'POST /v1/mod/ack': (b) => service.modAck(b),

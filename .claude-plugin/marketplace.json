@@ -7,7 +7,7 @@
       "name": "hinty-agents",
       "source": "./claude-plugin",
       "description": "Answer Claude Code permission prompts and follow sessions from Hinty smart-glasses or the Hinty web panel.",
-      "version": "0.2.0"
+      "version": "0.3.0"
     }
   ]
 }

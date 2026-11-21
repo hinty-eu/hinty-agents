@@ -9,7 +9,7 @@
 //   UserPromptSubmit, PostToolUse, SessionEnd  short status reports; never print anything.
 // Prints nothing but the fixed JSON below.
 
-const { CONTEXT, home, readJson, daemonInfo, request, autostart, readStdin } = require('./common.cjs')
+const { CONTEXT, home, readJson, daemonInfo, send, autostart, readStdin } = require('./common.cjs')
 
 const EVENT = process.argv[2] || ''
 const ALLOW = '{"hookSpecificOutput":{"hookEventName":"PermissionRequest","decision":{"behavior":"allow"}}}'
@@ -27,7 +27,8 @@ const HARD_EXIT_MS = 595000
 
 function hold(d, raw, print) {
   setTimeout(() => process.exit(0), HARD_EXIT_MS).unref()
-  request(d, 'POST', ROUTES[EVENT], raw, 0, print)
+  // the service proves itself first (signed ping, 1.5 s); only then the content goes out and the hook may wait
+  send(d, 'POST', ROUTES[EVENT], raw, 1500, 0, print)
 }
 
 function sessionStart(raw, dir) {
@@ -40,7 +41,7 @@ function sessionStart(raw, dir) {
   try { cwd = String(JSON.parse(raw).cwd || '') } catch (e) { /* no cwd */ }
   const d = daemonInfo(dir)
   if (!d) { autostart(cfg, cwd); finish(); return }
-  request(d, 'POST', ROUTES.SessionStart, raw, 1500, (ans) => {
+  send(d, 'POST', ROUTES.SessionStart, raw, 700, 1500, (ans) => {
     if (!ans) autostart(cfg, cwd)
     finish()
   })
@@ -77,7 +78,7 @@ function main() {
     })
   }
   // status reports: SessionEnd has 1 s in Codex, the others are not worth waiting for
-  request(d, 'POST', ROUTES[EVENT], raw, EVENT === 'SessionEnd' ? 700 : 1500, () => {})
+  send(d, 'POST', ROUTES[EVENT], raw, EVENT === 'SessionEnd' ? 300 : 500, EVENT === 'SessionEnd' ? 600 : 1500, () => {})
 }
 
 try { main() } catch (e) { process.exitCode = 0 }

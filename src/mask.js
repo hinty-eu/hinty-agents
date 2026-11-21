@@ -38,9 +38,15 @@ const TOKENS = [
   [/\b(hf_)[A-Za-z0-9]{30,}/g, `$1${M}`],
   [/\b(rnd_)[A-Za-z0-9]{16,}/g, `$1${M}`],
   [/\b(whsec_)[A-Za-z0-9]{16,}/g, `$1${M}`],
-  // JSON Web Tokens
-  [/\beyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}/g, `${M}jwt${M}`],
+  // JSON Web Tokens. The start is a lookbehind on the token alphabet, not `\b`: `\b` also matches after every `-`, and
+  // `-eyJ` repeated made each start read to the end of the run again (security review 2, Z11: 32 000 chars = 0.77 s).
+  // With the lookbehind a start is only possible after a character that cannot be part of the run (or after ONE dash
+  // that follows such a character: ` -eyJ…`), so every run is read a bounded number of times (linear).
+  [/(?<![A-Za-z0-9_]|[A-Za-z0-9_-]-)eyJ[A-Za-z0-9_-]{8,8000}\.[A-Za-z0-9_-]{8,8000}\.[A-Za-z0-9_-]{8,8000}/g, `${M}jwt${M}`],
 ]
+
+/** Every pattern, for the timing test (test/mask.test.js: 1 MB of crafted text per pattern). */
+export const PATTERNS = () => [...TOKENS.map(([re]) => re), KV, URL_CRED, PEM_BEGIN, PEM_END]
 
 // credentials inside URLs: scheme://user:password@host (scheme anchored and short, parts bounded)
 const URL_CRED = /(?<![A-Za-z0-9+.-])([A-Za-z][A-Za-z0-9+.-]{0,20}:\/\/[^\s:/@]{1,256}):([^\s@/]{1,256})@/g

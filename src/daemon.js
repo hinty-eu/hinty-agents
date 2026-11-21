@@ -5,7 +5,7 @@ import fs from 'node:fs'
 import path from 'node:path'
 import { newSecret } from './crypto.js'
 import { pingOwn } from './client.js'
-import { hardenEnv, isOurDaemonLine, processCommandLine } from './exec.js'
+import { hardenEnv } from './exec.js'
 import { daemonRecord } from './localauth.js'
 import { systemNotify } from './notify.js'
 import { SCRIPTS, hooksDir, sourceDir } from './adapters/hookfiles.js'
@@ -20,23 +20,26 @@ import { Relay } from './relay.js'
 import { Service } from './service.js'
 import { voiceReady } from './stt/install.js'
 import { SherpaEngine } from './stt/sherpa.js'
-import { ensureHome, isPaired, paths, pidAlive, readConfig, readDaemonInfo, readJson, updateConfig, writeJson } from './store.js'
+import { ensureHome, homeAccess, isPaired, paths, pidAlive, readConfig, readDaemonInfo, readJson, updateConfig, writeJson } from './store.js'
 import { VERSION } from './version.js'
 
 /**
- * Is this live pid our service? A signed /v1/ping with the same pid says so; else its command line must be
- * `node .../hinty-agents.js daemon` (security review point 7: a pid reused by another program does not count).
+ * Is this live pid our service? Only a signed /v1/ping answering with the same pid says so (security review point 7,
+ * review 2 Z13: a command line that merely looks like `hinty-agents.js daemon` does not count any more).
  * @param {number} pid
  */
 export async function isOurService(pid) {
   const info = readDaemonInfo()
-  if (info && info.pid === pid && await pingOwn(info)) return true
-  return isOurDaemonLine(processCommandLine(pid))
+  return !!info && info.pid === pid && await pingOwn(info)
 }
 
+/** How long a lock held by a live process that does not answer yet is respected (a service that is still starting). */
+export const LOCK_STARTUP_MS = 3000
+
 /**
- * Single instance per computer: an exclusive lock file with our pid. A lock left by a dead process, or whose pid now
- * belongs to another program, is taken over (logged).
+ * Single instance per computer: an exclusive lock file with our pid. A lock of a live process counts only once that
+ * process answers a signed ping; a process that holds the lock but never answers (a dead run's pid now used by another
+ * program, or something that looks like us) is waited for at most LOCK_STARTUP_MS, then the lock is taken over (logged).
  * @param {(m: string, f?: Record<string, any>) => void} log
  */
 async function takeLock(log) {
@@ -50,7 +53,12 @@ async function takeLock(log) {
       let other = 0
       try { other = Number(fs.readFileSync(lock, 'utf8').trim()) } catch { /* raced */ }
       if (other && other !== process.pid && pidAlive(other)) {
-        if (await isOurService(other)) return false
+        const t0 = Date.now()
+        while (pidAlive(other)) {
+          if (await isOurService(other)) return false
+          if (Date.now() - t0 >= LOCK_STARTUP_MS) break
+          await new Promise((r) => setTimeout(r, 250))
+        }
         log('lock_stale', { pid: other, why: 'not_our_service' })
       }
       try { fs.unlinkSync(lock) } catch { /* raced */ }
@@ -107,6 +115,8 @@ export async function runDaemon() {
   try { process.chdir(paths().home) } catch { /* stays */ }
   const p = paths()
   const log = createLog(p.log)
+  // the folder's access was narrowed and read back by ensureHome(); a failure is kept for `doctor` and logged (Z7)
+  if (!homeAccess().ok) log('home_access', { ok: false, problem: homeAccess().problem.slice(0, 80) })
   const config = readConfig()
   if (!isPaired(config) || !config) {
     log('not_paired')
@@ -133,6 +143,8 @@ export async function runDaemon() {
     log,
     // the person's consent, given at this computer, read again at every remote request (security review point 2)
     remoteAwayAllowed: () => readConfig()?.remoteAwayOn === true,
+    // when that consent was given: a remote switch-on lasts at most 12 h from it or from the last local `away on` (Z9)
+    remoteAwaySince: () => Number(readConfig()?.remoteAwayAt) || 0,
     onRemoteAway: (at) => {
       if (readConfig()?.notify === false || process.env.HINTY_AGENTS_NO_NOTIFY === '1') return
       log('notify', { kind: 'remote_away', started: systemNotify('remote_away', at) })
@@ -152,9 +164,11 @@ export async function runDaemon() {
     if (live) openclaw.start()
     else { openclaw.stop(); hermes.clear() }
   })
-  // instructions for Codex sessions go through `codex queue` when this Codex has it (HINTY_AGENTS_CODEX_SAY=hold forces the
-  // Stop-hook fallback, for tests); the probe runs in the background and never delays start
-  if (process.env.HINTY_AGENTS_CODEX_SAY !== 'hold') {
+  // instructions for Codex sessions go through `codex queue` when this Codex has it; `"codex": {"queue": false}` in
+  // config.json (or HINTY_AGENTS_CODEX_SAY=hold, for tests) keeps them on the held Stop hook instead: `codex queue` gets
+  // the text as a command-line argument, which other users of a shared Linux / macOS computer can see in the process
+  // list for a moment. The probe runs in the background and never delays start.
+  if (process.env.HINTY_AGENTS_CODEX_SAY !== 'hold' && config.codex?.queue !== false) {
     setImmediate(() => {
       try { if (codex.queueSupported()) { service.codexQueue = codex.queueMessage; log('codex_queue', { ok: true }) } else log('codex_queue', { ok: false }) } catch { log('codex_queue', { ok: false }) }
     })

@@ -39,14 +39,17 @@ test('pairing: paired carries the masked account (cleaned); malformed codes and 
   sock.server('pair_code', { code: '\x1b]0;evil\x07', expiresIn: 600 })
   sock.server('pair_code', { code: 'ACD4FG', expiresIn: 600 })
   assert.deepEqual(codes, ['ACD4FG'], 'only a code of the server alphabet is shown')
-  sock.server('paired', { token: 'T'.repeat(32), bridgeId: 'a'.repeat(24), account: 'a***@g***.com' })
-  assert.deepEqual(await p, { token: 'T'.repeat(32), bridgeId: 'a'.repeat(24), account: 'a***@g***.com' })
+  const hash = 'c'.repeat(64)
+  sock.server('paired', { token: 'T'.repeat(32), bridgeId: 'a'.repeat(24), account: 'a***@g***.com', checkHash: hash })
+  assert.deepEqual(await p, { token: 'T'.repeat(32), bridgeId: 'a'.repeat(24), account: 'a***@g***.com', checkHash: hash })
 
   const f2 = fakeIo()
   const p2 = pair({ api: 'http://x', io: f2.io, onCode: () => {} })
   f2.sock.server('connect')
   f2.sock.server('paired', { token: 'T'.repeat(32), bridgeId: 'b'.repeat(24) })
-  assert.equal((await p2).account, null, 'no account field: the CLI asks the person to check the panel')
+  const r2 = await p2
+  assert.equal(r2.account, null, 'no account field')
+  assert.equal(r2.checkHash, null, 'no checkHash: the CLI refuses the pairing')
 
   const f3 = fakeIo()
   const p3 = pair({ api: 'http://x', io: f3.io, onCode: () => {} })

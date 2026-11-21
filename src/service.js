@@ -43,9 +43,10 @@ export class Service {
    *   agents?: () => { agents: string[], grok?: { askShell: boolean, except: string[] } },
    *   codexQueue?: ((sid: string, text: string, home?: string) => Promise<boolean>) | null,
    *   codexPermTtlMs?: number, codexStopHoldMs?: number, grokPermTtlMs?: number,
-   *   remoteAwayAllowed?: () => boolean, onRemoteAway?: (at: number) => void }} o
+   *   remoteAwayAllowed?: () => boolean, remoteAwaySince?: () => number, onRemoteAway?: (at: number) => void }} o
    *   remoteAwayAllowed: did the person agree (config.json `remoteAwayOn`) that the relay may switch away mode ON?
-   *   Read at every remote `away {on:true}`; default no. onRemoteAway: a remote switch-on happened (local notice).
+   *   Read at every remote `away {on:true}`; default no. remoteAwaySince: when that consent was given (ms, config.json
+   *   `remoteAwayAt`; 0 = unknown). onRemoteAway: a remote switch-on happened (local notice).
    */
   constructor(o) {
     this.relay = o.relay
@@ -58,7 +59,10 @@ export class Service {
     this.host = oneLine(o.host ?? os.hostname(), 60)
     this.onUnpaired = o.onUnpaired || (() => {})
     this.remoteAwayAllowed = o.remoteAwayAllowed || (() => false)
+    this.remoteAwaySince = o.remoteAwaySince || (() => 0)
     this.onRemoteAway = o.onRemoteAway || (() => {})
+    /** the last switch-on at this computer (`away on`); with the consent time it bounds a remote switch-on (Z9) */
+    this.localOnAt = 0
     this.away = new AwayMode({ now: this.now, maxMs: o.awayMaxMs, onChange: (on, why) => this.onAwayChange(on, why) })
     this.voiceReady = o.voice ? o.voice.ready : () => false
     // E4: which agents are installed (for `hello`) and the Grok ask-shell option; read again on `agentsChanged()`
@@ -107,8 +111,9 @@ export class Service {
     this.cmdSeq = 0
     this.lastRefresh = 0
     this.relayInfo = { lastError: /** @type {string | null} */ (null), readyAt: 0 }
-    /** the last remote attempt to switch away mode on without the person's consent (for `status`) */
+    /** the last refused remote attempt to switch away mode on, and why: 'not_allowed' | 'expired' (for `status`) */
     this.remoteRefusedAt = 0
+    this.remoteRefusedWhy = ''
     this.startedAt = this.now()
   }
 
@@ -685,15 +690,27 @@ export class Service {
 
   /** At this computer (`away on|off`): switching on again starts the 12 h again. @param {boolean} on @param {string} why */
   setAway(on, why) {
+    if (on) this.localOnAt = this.now()
     const changed = this.away.set(on, why)
     if (!changed && on) this.send('away', { on: true }) // renewed: report again (12 h from now)
     return { away: this.away.on, until: this.away.until }
   }
 
   /**
+   * The latest moment a remote switch-on may last until: 12 h after the last switch-on (`away on`) or consent
+   * (`remote-away on`, the wizard) at this computer; 0 = neither is known (security review 2, Z9).
+   */
+  remoteAwayEnd() {
+    const anchor = Math.max(this.localOnAt, Number(this.remoteAwaySince()) || 0)
+    return anchor > 0 ? anchor + this.away.maxMs : 0
+  }
+
+  /**
    * `away {on}` from the relay (panel, glasses). OFF always works. ON only with the person's consent given at this
    * computer (config.json `remoteAwayOn`); without it the request is refused and the bridge keeps reporting `off`.
-   * A remote ON never extends the 12 h of a mode that is already on. Every remote switch-on is logged and reported
+   * A remote ON never extends the 12 h of a mode that is already on, and it never lasts past 12 h after the last
+   * switch-on or consent AT THIS COMPUTER: remote off + on does not start the 12 h again, and once they are over a
+   * remote ON is refused until the person does something here (Z9). Every remote switch-on is logged and reported
    * locally (status, the Claude Code status line and a toast, a system notification).
    * @param {boolean} on
    */
@@ -704,13 +721,16 @@ export class Service {
       this.send('away', { on: true })
       return
     }
-    if (!this.remoteAwayAllowed()) {
+    const refuse = (/** @type {string} */ why) => {
       this.remoteRefusedAt = this.now()
-      this.log('away_remote_refused', { reason: 'not_allowed_here' })
+      this.remoteRefusedWhy = why
+      this.log('away_remote_refused', { reason: why === 'expired' ? 'over_12h_since_local' : 'not_allowed_here' })
       this.send('away', { on: false })
-      return
     }
-    this.away.set(true, 'remote', { renew: false })
+    if (!this.remoteAwayAllowed()) return refuse('not_allowed')
+    const end = this.remoteAwayEnd()
+    if (!end || this.now() >= end) return refuse('expired')
+    this.away.set(true, 'remote', { renew: false, until: end })
     this.log('away_remote_on', { result: 'on', at: new Date(this.away.since).toISOString() })
     try { this.onRemoteAway(this.away.since) } catch { /* a notice never breaks the service */ }
   }
@@ -795,7 +815,8 @@ export class Service {
       relay: { connected: this.relay.connected, lastError: this.relayInfo.lastError, readyAt: this.relayInfo.readyAt },
       away: {
         on: this.away.isOn(), until: this.away.until, since: this.away.since, by: this.away.by,
-        remoteAllowed: this.remoteAwayAllowed(), remoteRefusedAt: this.remoteRefusedAt,
+        remoteAllowed: this.remoteAwayAllowed(), remoteRefusedAt: this.remoteRefusedAt, remoteRefusedWhy: this.remoteRefusedWhy,
+        remoteEnd: this.remoteAwayEnd(),
       },
       sessions: this.sessions.list().map((s) => ({
         sid: s.sid.slice(0, 8), label: s.label, agent: s.agent, st: s.st, mod: !!s.modSeenAt,

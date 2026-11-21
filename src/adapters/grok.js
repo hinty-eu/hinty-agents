@@ -15,7 +15,7 @@ import os from 'node:os'
 import path from 'node:path'
 import { resolveProgram, runSync } from '../exec.js'
 import { readConfig } from '../store.js'
-import { hooksDir, installScripts, q } from './hookfiles.js'
+import { checkCommandNode, hooksDir, installScripts, nodeCommand, q } from './hookfiles.js'
 
 export const id = 'grok'
 export const caps = { perm: 'veto-only', say: 'none' }
@@ -48,9 +48,12 @@ export function detect() {
   return { found: true, version: m ? m[1] : String(r.stdout || '').trim().slice(0, 40) }
 }
 
-/** @param {string} event @param {number} [holdS] */
+/**
+ * The hook command: this Node.js by full path (never `node` by name, security review 2, Z3), the script, the event.
+ * @param {string} event @param {number} [holdS]
+ */
 export const commandFor = (event, holdS) =>
-  `node ${q(path.join(hooksDir(), 'grok-hook.cjs'))} ${event}${holdS ? ` ${holdS}` : ''}`
+  `${nodeCommand()} ${q(path.join(hooksDir(), 'grok-hook.cjs'))} ${event}${holdS ? ` ${holdS}` : ''}`
 
 /**
  * The content of hinty.json (pure).
@@ -92,6 +95,7 @@ export function install(o = {}) {
   }
   fs.writeFileSync(file, JSON.stringify(buildConfig(o), null, 2) + '\n')
   steps.push({ step: 'hooks', ok: true, message: `${file}${o.askShell ? ' (with --ask-shell)' : ''}` })
+  steps.push({ step: 'node', ok: true, message: `the hooks start Node.js by its full path (${nodeCommand()}); if you remove or move this Node.js, run install grok again (doctor checks it)` })
   steps.push({
     step: 'trust', ok: true,
     message: 'personal hooks (~/.grok/hooks) are read at the next Grok session; check /hooks in Grok\'s extensions modal',
@@ -123,13 +127,30 @@ export function uninstall() {
   return { ok: true, steps }
 }
 
-/** @returns {{ installed: boolean, askShell: boolean, file: string }} */
+/**
+ * @returns {{ installed: boolean, askShell: boolean, file: string, node: { ok: boolean, node: string, byName: boolean } | null }}
+ *   node: the Node.js the hook commands start (doctor checks it)
+ */
 export function installed() {
   const file = hooksFile()
-  if (!isOurFile(file)) return { installed: false, askShell: false, file }
+  if (!isOurFile(file)) return { installed: false, askShell: false, file, node: null }
   let askShell = false
-  try { askShell = !!JSON.parse(fs.readFileSync(file, 'utf8'))?.hooks?.PreToolUse } catch { /* unreadable */ }
-  return { installed: true, askShell, file }
+  /** @type {{ ok: boolean, node: string, byName: boolean } | null} */
+  let node = null
+  try {
+    const hooks = JSON.parse(fs.readFileSync(file, 'utf8'))?.hooks || {}
+    askShell = !!hooks.PreToolUse
+    for (const groups of Object.values(hooks)) {
+      for (const gr of Array.isArray(groups) ? groups : []) {
+        for (const h of Array.isArray(gr && gr.hooks) ? gr.hooks : []) {
+          if (typeof h?.command !== 'string' || !h.command.includes(MARKER)) continue
+          const n = checkCommandNode(h.command)
+          if (!node || (node.ok && !n.ok)) node = n
+        }
+      }
+    }
+  } catch { /* unreadable */ }
+  return { installed: true, askShell, file, node }
 }
 
 /** Is ask-shell on (installed with --ask-shell)? */

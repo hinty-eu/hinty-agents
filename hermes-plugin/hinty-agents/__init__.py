@@ -63,7 +63,10 @@ def _daemon():
         port = d.get("port")
         if not isinstance(port, int) or not 0 < port < 65536:
             return None
-        return port, d["key"]
+        pid = d.get("pid")
+        if not isinstance(pid, int) or pid <= 0:
+            return None
+        return port, d["key"], pid
     except Exception:
         return None
 
@@ -72,21 +75,17 @@ def _mac(key, msg):
     return hmac.new(key.encode("utf-8"), msg.encode("utf-8"), hashlib.sha256).hexdigest()
 
 
-def _post(path, body, timeout):
-    """POST json to the bridge; raises on anything unexpected (no bridge, bad signature, bad status)."""
-    info = _daemon()
-    if not info:
-        raise RuntimeError("hinty: the bridge is not running")
-    port, key = info
+def _signed(port, key, method, path, data, timeout):
+    """One signed request; the answer counts only with the bridge's signature. Raises otherwise."""
     nonce = secrets.token_hex(16)
     ts = str(int(time.time() * 1000))
-    data = json.dumps(body).encode("utf-8")
-    auth = _mac(key, "hinty-req\n%d\n%s\n%s\nPOST\n%s\n%s" % (PV, ts, nonce, path, hashlib.sha256(data).hexdigest()))
+    auth = _mac(key, "hinty-req\n%d\n%s\n%s\n%s\n%s\n%s" % (PV, ts, nonce, method, path, hashlib.sha256(data).hexdigest()))
+    headers = {"x-hinty-pv": str(PV), "x-hinty-ts": ts, "x-hinty-nonce": nonce, "x-hinty-auth": auth, "connection": "close"}
+    if data:
+        headers["content-type"] = "application/json"
     conn = http.client.HTTPConnection("127.0.0.1", port, timeout=timeout)
     try:
-        conn.request("POST", path, body=data, headers={
-            "content-type": "application/json", "x-hinty-pv": str(PV), "x-hinty-ts": ts, "x-hinty-nonce": nonce,
-            "x-hinty-auth": auth, "connection": "close"})
+        conn.request(method, path, body=data if data else None, headers=headers)
         res = conn.getresponse()
         raw = res.read()
         if res.status != 200:
@@ -98,6 +97,21 @@ def _post(path, body, timeout):
         return json.loads(text) if text else {}
     finally:
         conn.close()
+
+
+def _post(path, body, timeout):
+    """POST json to the bridge; raises on anything unexpected (no bridge, bad signature, bad status).
+
+    Security review 2, Z6: the bridge proves itself first with a signed answer to /v1/ping carrying the pid from
+    daemon.json (at most 1.5 s); a process that took the port of a dead bridge never gets the command or any text."""
+    info = _daemon()
+    if not info:
+        raise RuntimeError("hinty: the bridge is not running")
+    port, key, pid = info
+    ping = _signed(port, key, "GET", "/v1/ping", b"", min(1.5, timeout))
+    if not isinstance(ping, dict) or ping.get("ok") is not True or ping.get("pid") != pid:
+        raise RuntimeError("hinty: not the bridge")
+    return _signed(port, key, "POST", path, json.dumps(body).encode("utf-8"), timeout)
 
 
 # ---------------------------------------------------------------- approval transport

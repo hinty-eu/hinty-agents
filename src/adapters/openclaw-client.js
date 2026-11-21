@@ -3,10 +3,14 @@
 // No dependencies: the built-in WebSocket (Node 22+) and Ed25519 from node:crypto.
 //
 // Frames are JSON text: {type:'req', id, method, params} / {type:'res', id, ok, payload|error} / {type:'event', event, payload}.
-// The Gateway opens with `connect.challenge {nonce, ts}`; we answer with `connect` carrying a signature of that nonce by the
-// bridge's own device key, so the first connection from the loopback pairs by itself and gives us a DEVICE TOKEN. That token
-// has `operator.write` (it can message every session), so it lives in a 0600 file under $HINTY_AGENTS_HOME/openclaw and is
-// never logged and never leaves the computer.
+// The Gateway opens with `connect.challenge {nonce, ts}`; we answer with `connect` carrying a signature of that nonce by a
+// device key of the bridge, so the first connection from the loopback pairs by itself and gives us a DEVICE TOKEN.
+//
+// Two devices, two tokens (security review 2, Z1): OpenClaw runs `/approve <id> allow-always` (and other commands) sent as
+// chat text whenever the SENDING connection has `operator.approvals`. So the connection that receives and answers approval
+// prompts (`approver`: read + approvals) never sends chat text, and chat text goes only over a second connection without
+// that scope (`writer`: read + write), where OpenClaw refuses `/approve` however the text is dressed up. The tokens live
+// in 0600 files under $HINTY_AGENTS_HOME/openclaw and are never logged and never leave the computer.
 //
 // Protocol versions: the Gateway demands exactly its own number (3 in 2026.3.x, 4 from 2026.8). We offer 4 first; on
 // `protocol mismatch` the error says which one it speaks (`expectedProtocol`) and we reconnect with that one.
@@ -20,8 +24,10 @@ const SPKI_PREFIX = Buffer.from('302a300506032b6570032100', 'hex')
 /** @param {Buffer} buf */
 const b64u = (buf) => buf.toString('base64').replaceAll('+', '-').replaceAll('/', '_').replace(/=+$/g, '')
 
-/** The scopes we ask for: read (sessions), write (chat.send) and approvals. Never `operator.admin`. */
-export const SCOPES = ['operator.read', 'operator.write', 'operator.approvals']
+/** The approvals connection: sessions (read) and approval prompts. No `operator.write`: it never sends chat text. */
+export const APPROVER_SCOPES = ['operator.read', 'operator.approvals']
+/** The connection for instructions (`chat.send`): read and write, NEVER `operator.approvals`. Never `operator.admin`. */
+export const WRITER_SCOPES = ['operator.read', 'operator.write']
 export const CLIENT_NAME = 'Hinty Agents'
 
 /** @typedef {{ version: 1, deviceId: string, publicKeyPem: string, privateKeyPem: string, createdAtMs: number }} Identity */
@@ -43,6 +49,13 @@ export function loadIdentity(file, o = {}) {
     if (j && j.version === 1 && j.publicKeyPem && j.privateKeyPem && j.deviceId) return j
   } catch { /* none yet */ }
   if (o.create === false) return null
+  const id = newIdentity()
+  saveIdentity(file, id)
+  return id
+}
+
+/** A new Ed25519 device identity (not saved). @returns {Identity} */
+export function newIdentity() {
   const { publicKey, privateKey } = crypto.generateKeyPairSync('ed25519')
   const publicKeyPem = publicKey.export({ type: 'spki', format: 'pem' }).toString()
   const privateKeyPem = privateKey.export({ type: 'pkcs8', format: 'pem' }).toString()
@@ -51,9 +64,15 @@ export function loadIdentity(file, o = {}) {
     version: 1, deviceId: crypto.createHash('sha256').update(rawPublicKey(publicKeyPem)).digest('hex'),
     publicKeyPem, privateKeyPem, createdAtMs: Date.now(),
   }
-  fs.mkdirSync(path.dirname(file), { recursive: true })
-  fs.writeFileSync(file, JSON.stringify(id, null, 2), { mode: 0o600 })
   return id
+}
+
+/** Save an identity, readable by the owner only. @param {string} file @param {Identity} id */
+export function saveIdentity(file, id) {
+  fs.mkdirSync(path.dirname(file), { recursive: true })
+  const tmp = `${file}.${process.pid}.tmp`
+  fs.writeFileSync(tmp, JSON.stringify(id, null, 2), { mode: 0o600 })
+  fs.renameSync(tmp, file)
 }
 
 /**
@@ -156,7 +175,7 @@ export class GatewayClient extends EventEmitter {
   async sendConnect(proto, challenge) {
     const nonce = String(challenge?.nonce || '')
     const signedAt = Number.isInteger(challenge?.ts) ? challenge.ts : Date.now()
-    const scopes = this.o.scopes || SCOPES
+    const scopes = this.o.scopes || APPROVER_SCOPES
     const id = this.o.identity
     // like OpenClaw's own client: `auth.token` is the shared token, else the stored device token; the signature binds it
     const tokenForSig = this.o.token || this.o.deviceToken || ''

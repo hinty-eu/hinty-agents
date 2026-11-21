@@ -2,7 +2,8 @@
 // Local protocol v2 (N9, security review point 1). The key in daemon.json NEVER travels: every request to the service's
 // 127.0.0.1 port carries an HMAC-SHA256 of a one-time nonce, a timestamp, the method, the path and the SHA-256 of the body,
 // and every 200 answer carries an HMAC of the request's nonce, the status and the SHA-256 of the answer's body. A process
-// that grabbed a stale port learns nothing it can use: it can neither answer for the service nor replay a request later.
+// that grabbed a stale port can neither answer for the service nor replay a request later, and since review 2 (Z6) the
+// hooks, the mod and the Hermes plugin send content only after a signed /v1/ping that names the pid of daemon.json.
 //
 // The same scheme is written out four more times, because those clients cannot import this file:
 //   claude-plugin/hook.cjs, hooks/common.cjs (Codex, Grok), claude-plugin/hooks/register.mjs (the mod, crypto.subtle only),

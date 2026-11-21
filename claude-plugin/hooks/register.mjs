@@ -24,7 +24,7 @@ import { hmacSha256Hex, nonce, sha256Hex } from './hmac.mjs'
 
 /** @typedef {import('claude-code').On} On */
 /** @typedef {import('claude-code').EngineInterface} Engine */
-/** @typedef {{ port: number, key: string }} Info */
+/** @typedef {{ port: number, key: string, pid: number }} Info */
 
 const POLL_AWAY_MS = 1000
 const POLL_IDLE_MS = 5000
@@ -54,28 +54,42 @@ async function loadInfo($) {
   const base = own && isAbs(own) ? own : `${(await $.env.get('USERPROFILE')) || (await $.env.get('HOME')) || ''}/.hinty-agents`
   try {
     const d = JSON.parse(String(await $.fs.read(`${base}/daemon.json`)))
-    if (d.pv !== PV || !Number.isInteger(d.port) || typeof d.key !== 'string' || d.key.length < 32) return null
-    return { port: d.port, key: d.key }
+    if (d.pv !== PV || !Number.isInteger(d.port) || typeof d.key !== 'string' || d.key.length < 32 || !Number.isInteger(d.pid)) return null
+    return { port: d.port, key: d.key, pid: d.pid }
   } catch {
     return null
   }
 }
 
-/** @param {Engine} $ @param {Info} c @param {string} path @param {unknown} body */
-async function call($, c, path, body) {
+/**
+ * One signed request; the answer counts only with the service's signature. @param {Engine} $ @param {Info} c
+ * @param {'GET' | 'POST'} method @param {string} path @param {string} text body ('' for GET) @param {number} [ms] limit
+ */
+async function signed($, c, method, path, text, ms) {
   const n = nonce()
   const ts = String(Date.now())
-  const text = JSON.stringify(body)
-  const auth = await hmacSha256Hex(c.key, `hinty-req\n${PV}\n${ts}\n${n}\nPOST\n${path}\n${await sha256Hex(text)}`)
-  const res = await $.http.fetch(`http://127.0.0.1:${c.port}${path}`, {
-    method: 'POST',
-    headers: { 'content-type': 'application/json', 'x-hinty-pv': String(PV), 'x-hinty-ts': ts, 'x-hinty-nonce': n, 'x-hinty-auth': auth },
-    body: text,
+  const auth = await hmacSha256Hex(c.key, `hinty-req\n${PV}\n${ts}\n${n}\n${method}\n${path}\n${await sha256Hex(text)}`)
+  const req = $.http.fetch(`http://127.0.0.1:${c.port}${path}`, {
+    method,
+    headers: { ...(text ? { 'content-type': 'application/json' } : {}), 'x-hinty-pv': String(PV), 'x-hinty-ts': ts, 'x-hinty-nonce': n, 'x-hinty-auth': auth },
+    ...(text ? { body: text } : {}),
   })
+  const res = /** @type {any} */ (await (ms ? Promise.race([req, $.clock.sleep(ms).then(() => { throw new Error('timeout') })]) : req))
   if (res.status !== 200) throw new Error(`http ${res.status}`)
   const want = await hmacSha256Hex(c.key, `hinty-res\n${PV}\n${n}\n200\n${await sha256Hex(res.text)}`)
   if (res.headers['x-hinty-sig'] !== want) throw new Error('signature')
   return JSON.parse(res.text)
+}
+
+/**
+ * A request with content. Security review 2, Z6: the service proves itself first with a signed /v1/ping carrying the
+ * pid from daemon.json; a process that took the port of a dead service gets nothing (not the session id, not an answer).
+ * @param {Engine} $ @param {Info} c @param {string} path @param {unknown} body
+ */
+async function call($, c, path, body) {
+  const p = await signed($, c, 'GET', '/v1/ping', '', 1000)
+  if (!p || p.ok !== true || p.pid !== c.pid) throw new Error('not our service')
+  return signed($, c, 'POST', path, JSON.stringify(body))
 }
 
 /**

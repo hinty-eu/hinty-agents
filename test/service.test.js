@@ -205,7 +205,7 @@ function wired(o = {}) {
 
 test('N5: with away mode off the socket carries only hello/away, never sess, perm or msg', async () => {
   // this test switches away mode on from the relay, so the person has agreed to that here (remoteAwayOn)
-  const { sock, relay, svc } = wired({ remoteAwayAllowed: () => true })
+  const { sock, relay, svc } = wired({ remoteAwayAllowed: () => true, remoteAwaySince: () => Date.now() })
   sock.serverSends('ready', { v: 1, bridgeId: 'a'.repeat(24), label: 'pc' })
   const t0 = Date.now()
   assert.deepEqual(await svc.hookPermission(input()), {})

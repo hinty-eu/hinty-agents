@@ -23,7 +23,7 @@ const GLASSES = '\u{1F453}'
 
 // Characters that change how text looks without being visible text: direction controls (bidi), zero-width characters,
 // word joiner and invisible operators, byte order mark, interlinear annotation.
-const INVISIBLE = /[\u061c\u200b-\u200f\u202a-\u202e\u2060-\u2064\u2066-\u206f\ufeff\ufff9-\ufffb]/g
+const INVISIBLE = /[\u034f\u061c\u17b4\u17b5\u180b-\u180f\u200b-\u200f\u202a-\u202e\u2060-\u2064\u2066-\u206f\ufeff\ufff9-\ufffb]/g
 // C0 controls except tab and newline, DEL, C1 controls
 const CONTROL = /[\x00-\x08\x0b\x0c\x0e-\x1f\x7f-\x9f]/g
 
@@ -39,18 +39,54 @@ export function cutUnits(s, max) {
   return out
 }
 
+// Characters that render as blank space (security review 2, Z4): every Unicode White_Space character except the line
+// break, plus the "blank" letters and symbols (Braille blank U+2800, Hangul fillers U+115F U+1160 U+3164 U+FFA0).
+// A run of them can push the part of a command that runs off the first screen of a card.
+const BLANK = '[^\\S\\n]|[\\u2800\\u115f\\u1160\\u3164\\uffa0]'
+/** a line made only of blank characters, at least one of them not a plain space or tab */
+const ODD_BLANK_LINE = new RegExp(`^(?=(?:${BLANK})*?[^ \\t\\n])(?:${BLANK})+$`, 'gmu')
+/** 3+ empty lines in a row (after the line above) */
+const BLANK_LINES = /\n(?:[ \t]*\n){3,}/g
+/** a run of more than 20 blank characters after visible text, or more than 64 at the start of a line (like Hermes) */
+const MID_RUN = new RegExp(`(?<=[^\\s\\u2800\\u115f\\u1160\\u3164\\uffa0])(?:${BLANK}){21,}`, 'gu')
+const LEAD_RUN = new RegExp(`^(?:${BLANK}){65,}`, 'gmu')
+/** tabs weigh more (one tab can be 8 columns): 8+ after text, 12+ at the start of a line; each step is `\t *`, so the
+ * pattern has one way to match and cannot backtrack for long */
+const MID_TABS = /(?<=\S) *(?:\t *){8,}/g
+const LEAD_TABS = /^ *(?:\t *){12,}/gm
+/** blank characters other than space and tab inside a line of text, in a run of 2+ (single ones are left) */
+const ODD_RUN = /(?:(?![ \t])[^\S\n]|[\u2800\u115f\u1160\u3164\uffa0]){2,}/gu
+
 /**
- * Line breaks normalised, control and invisible characters removed, at most two empty lines in a row.
+ * Line breaks normalised, control and invisible characters removed, blank padding folded: a line of only blank
+ * characters of any kind becomes empty, at most two empty lines in a row, a run of more than 20 blank characters after
+ * text (more than 64 at the start of a line) becomes one space, a run of 2+ unusual blanks (U+00A0, U+3000, U+2800...)
+ * one space. `changed` = anything of that happened (a card with it is incomplete); an ordinary indentation, a line of
+ * spaces in code or two empty lines change nothing.
  * @param {string} s @returns {{ text: string, changed: boolean }}
  */
 export function cleanText(s) {
   let t = String(s ?? '').replace(/\r\n/g, '\n')
-  const before = t
-  t = t.replace(/[\r\u2028\u2029\u0085]/g, '\n')
-    .replace(CONTROL, ' ')
-    .replace(INVISIBLE, '')
-    .replace(/\n(?:[ \t]*\n){3,}/g, '\n\n\n')
-  return { text: t, changed: t !== before }
+  let changed = false
+  /** @param {RegExp} re @param {string | ((m: string) => string)} to */
+  const sub = (re, to) => {
+    t = t.replace(re, (/** @type {string} */ m) => {
+      const r = typeof to === 'function' ? to(m) : to
+      if (r !== m) changed = true
+      return r
+    })
+  }
+  sub(/[\r\u2028\u2029\u0085]/g, '\n')
+  sub(CONTROL, ' ')
+  sub(INVISIBLE, '')
+  sub(ODD_BLANK_LINE, '')
+  sub(BLANK_LINES, '\n\n\n')
+  sub(LEAD_RUN, ' ')
+  sub(MID_RUN, ' ')
+  sub(LEAD_TABS, ' ')
+  sub(MID_TABS, ' ')
+  sub(ODD_RUN, ' ')
+  return { text: t, changed }
 }
 
 /** @param {number} n */

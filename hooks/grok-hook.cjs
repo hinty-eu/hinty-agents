@@ -8,7 +8,7 @@
 //                      permission checks still apply). "Allow" from the glasses only means "no veto".
 // Prints nothing but the fixed JSON below.
 
-const { home, daemonInfo, request, readStdin } = require('./common.cjs')
+const { home, daemonInfo, send, readStdin } = require('./common.cjs')
 
 const EVENT = process.argv[2] || ''
 const HOLD_S = Number(process.argv[3]) || 0
@@ -29,7 +29,8 @@ function main() {
   if (EVENT === 'PreToolUse') {
     // leave before Grok's own timeout (hinty.json: hold + 20 s); the service gives up at hold seconds
     if (HOLD_S) setTimeout(() => process.exit(0), (HOLD_S + 10) * 1000).unref()
-    return request(d, 'POST', ROUTES.PreToolUse, raw, 0, (ans) => {
+    // the service proves itself first (signed ping); only then the command goes out and the hook may wait
+    return send(d, 'POST', ROUTES.PreToolUse, raw, 1500, 0, (ans) => {
       if (ans && ans.d === 'deny') {
         process.stdout.write(DENY)
         process.stderr.write('Denied from Hinty glasses')
@@ -37,7 +38,7 @@ function main() {
       }
     })
   }
-  request(d, 'POST', ROUTES[EVENT], raw, EVENT === 'SessionEnd' ? 700 : 1500, () => {})
+  send(d, 'POST', ROUTES[EVENT], raw, EVENT === 'SessionEnd' ? 300 : 500, EVENT === 'SessionEnd' ? 600 : 1500, () => {})
 }
 
 try { main() } catch (e) { process.exitCode = 0 }

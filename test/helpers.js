@@ -16,7 +16,8 @@ export function writeDaemon(dir, o) {
  */
 export async function fakeService(dir, routes, o = {}) {
   const key = o.key || newSecret()
-  const s = /** @type {any} */ (createLocalServer({ key, routes }))
+  // like the real service: the hooks ping first (review 2, Z6) and want this process's pid back
+  const s = /** @type {any} */ (createLocalServer({ key, routes: { 'GET /v1/ping': () => ({ ok: true, v: 2, pid: process.pid }), ...routes } }))
   const port = await listenLoopback(s)
   writeDaemon(dir, { port, key: o.writeKey || key })
   s.key = key

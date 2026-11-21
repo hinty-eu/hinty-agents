@@ -37,9 +37,15 @@ function readJson(file) {
   try { return JSON.parse(fs.readFileSync(file, 'utf8')) } catch (e) { return null }
 }
 
+function pidAlive(pid) {
+  try { process.kill(pid, 0); return true } catch (e) { return e.code === 'EPERM' }
+}
+
+// daemon.json of a LIVE service of this protocol, else null (a dead service's port may belong to anybody now)
 function daemonInfo(dir) {
   const d = readJson(require('path').join(dir, 'daemon.json'))
   if (!d || d.pv !== PV || !Number.isInteger(d.port) || d.port <= 0 || d.port > 65535 || typeof d.key !== 'string' || d.key.length < 32) return null
+  if (!Number.isInteger(d.pid) || d.pid <= 0 || !pidAlive(d.pid)) return null
   return d
 }
 
@@ -78,15 +84,25 @@ function request(d, method, path, body, timeoutMs, cb) {
   req.end(buf.length ? buf : undefined)
 }
 
+// Security review 2, Z6: nothing with content goes to the port before the service has proved itself with a signed
+// answer to /v1/ping carrying the pid from daemon.json. A process that took the port of a dead service learns nothing
+// and cannot hold the hook: an unsigned or missing answer ends the hook within `ms`.
+function verified(d, ms, cb) {
+  request(d, 'GET', '/v1/ping', '', ms, (ans) => cb(!!ans && ans.ok === true && ans.pid === d.pid))
+}
+
 function permission(raw, dir) {
   const d = daemonInfo(dir)
   if (!d) return
   // never outlive Claude Code's own limit (900 s in hooks.json); the service gives up at 840 s
   setTimeout(() => process.exit(0), 895000).unref()
-  request(d, 'POST', '/v1/hook/permission', raw, 0, (ans) => {
-    // N2: only these two fixed answers can ever be printed
-    if (ans && ans.d === 'allow') process.stdout.write(ALLOW)
-    else if (ans && ans.d === 'deny') process.stdout.write(DENY)
+  verified(d, 1500, (ok) => {
+    if (!ok) return
+    request(d, 'POST', '/v1/hook/permission', raw, 0, (ans) => {
+      // N2: only these two fixed answers can ever be printed
+      if (ans && ans.d === 'allow') process.stdout.write(ALLOW)
+      else if (ans && ans.d === 'deny') process.stdout.write(DENY)
+    })
   })
 }
 
@@ -133,9 +149,12 @@ function sessionStart(raw, dir) {
   }))
   const d = daemonInfo(dir)
   if (!d) { autostart(cfg, raw); finish(); return }
-  request(d, 'POST', '/v1/hook/session-start', raw, 1500, (ans) => {
-    if (!ans) autostart(cfg, raw)
-    finish()
+  verified(d, 700, (ok) => {
+    if (!ok) { autostart(cfg, raw); finish(); return }
+    request(d, 'POST', '/v1/hook/session-start', raw, 1500, (ans) => {
+      if (!ans) autostart(cfg, raw)
+      finish()
+    })
   })
 }
 
@@ -144,7 +163,7 @@ function doctor(dir) {
   const d = daemonInfo(dir)
   if (!d) { process.stdout.write(JSON.stringify({ ok: false, why: 'not_running' })); return }
   request(d, 'GET', '/v1/ping', '', 3000, (ans) => {
-    process.stdout.write(JSON.stringify({ ok: !!(ans && ans.ok), ms: Date.now() - t0, pv: PV }))
+    process.stdout.write(JSON.stringify({ ok: !!(ans && ans.ok && ans.pid === d.pid), ms: Date.now() - t0, pv: PV }))
   })
 }
 

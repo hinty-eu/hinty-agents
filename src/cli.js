@@ -9,9 +9,9 @@ import * as claude from './adapters/claude.js'
 import { ADAPTERS, get as getAdapter } from './adapters/index.js'
 import { childEnv, hardenEnv, isOurDaemonLine, processCommandLine, sysExe } from './exec.js'
 import { hhmm } from './notify.js'
-import { prettyCode, pair } from './pair.js'
+import { CHECK_TRIES, checkMatches, prettyCode, pair } from './pair.js'
 import { Relay } from './relay.js'
-import { DEFAULT_API, cliEntry, ensureHome, isPaired, paths, pidAlive, readConfig, readDaemonAny, readDaemonInfo, updateConfig } from './store.js'
+import { DEFAULT_API, cliEntry, ensureHome, homeAccess, homeDir, isPaired, paths, pidAlive, readConfig, readDaemonAny, readDaemonInfo, updateConfig } from './store.js'
 import { oneLine } from './text.js'
 import { MODELS } from './stt/models.js'
 import { fmtMB, installVoice, removeVoice, voiceStatus } from './stt/install.js'
@@ -57,6 +57,8 @@ export async function main(argv) {
   // never run a program from the current folder (security review point 6)
   hardenEnv()
   const [cmd, ...rest] = argv
+  // the data folder's access is narrowed (and read back) at every start, not only when it is created (review 2, Z7)
+  if (fs.existsSync(homeDir())) { try { ensureHome() } catch { /* doctor reports it */ } }
   try {
     return await dispatch(cmd, rest, argv)
   } finally {
@@ -137,6 +139,14 @@ export function ask(question) {
   return new Promise((resolve) => waiting.push(resolve))
 }
 
+/**
+ * Is a person at this terminal (stdin is a TTY)? HINTY_AGENTS_TEST_PIPED_INPUT=1 lets the end-to-end tests drive the
+ * wizard through a pipe; whoever can set that variable for your wizard already controls this computer.
+ */
+export function interactive() {
+  return !!process.stdin.isTTY || process.env.HINTY_AGENTS_TEST_PIPED_INPUT === '1'
+}
+
 /** @param {string} question @returns {Promise<boolean>} only y / yes counts */
 export async function askYes(question) {
   return /^\s*(y|yes)\s*$/i.test(await ask(question))
@@ -173,8 +183,10 @@ const REMOTE_AWAY_TEXT = [
   'You can also allow switching it ON remotely (from the Hinty panel or your glasses).',
   'Risk: whoever gets into your Hinty account (or the Hinty server) could then switch it on while you are not at',
   'the desk and, with an agent session open, send it instructions and approve its steps on this computer.',
-  'A remote switch-on is shown here (status line in Claude Code, a notification, `npx hinty-agents status`), it never',
-  'extends the 12 hours, and switching away mode OFF remotely always works.',
+  'A remote switch-on is shown here (status line in Claude Code, a notification, `npx hinty-agents status`). It lasts',
+  'at most until 12 hours after you last switched away mode on HERE or gave this consent; switching it off and on',
+  'again remotely does not start the 12 hours again, and after them a remote switch-on is refused until you run',
+  '`away on` or `remote-away on` here again. Switching away mode OFF remotely always works.',
   'Change it any time: npx hinty-agents remote-away on|off',
 ]
 
@@ -224,16 +236,20 @@ async function stop() {
   }
   if (!any) { out('The service is not running.'); return 0 }
   const pid = any.pid
-  const signed = !!any.info && await pingOwn(any.info)
-  const ours = pidAlive(pid) && (signed || isOurDaemonLine(processCommandLine(pid)))
-  if (!ours) {
-    removeFiles()
-    out(pidAlive(pid)
-      ? `The service is not running (its old pid ${pid} now belongs to another program, which was left alone).`
-      : 'The service is not running.')
+  // review 2, Z13: only a signed answer with this pid proves the process is our service; a command line that looks
+  // like ours does not (it may be another installation's service or anything named like it)
+  const signed = !!any.info && pidAlive(pid) && await pingOwn(any.info)
+  if (!signed) {
+    const older = any.old && pidAlive(pid) && isOurDaemonLine(processCommandLine(pid))
+    if (!older) removeFiles()
+    out(older
+      ? c.warn(`An older version of the service (pid ${pid}) may be running; it cannot prove it is the service, so it was not stopped. Stop it yourself (${process.platform === 'win32' ? `taskkill /PID ${pid} /T` : `kill ${pid}`}) if it is.`)
+      : pidAlive(pid)
+        ? `The service is not running (its old pid ${pid} now belongs to another program, which was left alone).`
+        : 'The service is not running.')
     return 0
   }
-  if (signed) { try { await call('POST', '/v1/stop') } catch { /* not answering */ } }
+  try { await call('POST', '/v1/stop') } catch { /* not answering */ }
   for (let i = 0; i < 40 && pidAlive(pid); i++) await sleep(100)
   if (pidAlive(pid)) {
     if (process.platform === 'win32') spawnSync(sysExe('taskkill.exe'), ['/PID', String(pid), '/T', '/F'], { stdio: 'ignore', windowsHide: true, cwd: os.homedir() })
@@ -272,6 +288,11 @@ async function setup(args) {
   } else {
     const api = apiFor(null)
     if (!checkApi(api)) return 1
+    // a person has to copy a number from the panel into this terminal (Z10): no terminal, no pairing
+    if (!interactive()) {
+      out(c.bad('\n✗ Pairing needs a person at this terminal: run `npx hinty-agents` in a terminal (not with piped input) and type the 4-digit number the Hinty panel shows.'))
+      return 1
+    }
     out(`\nPairing with ${api} ...`)
     let res
     try {
@@ -284,6 +305,7 @@ async function setup(args) {
           out(url
             ? `  Open ${url} and type the code (valid ${Math.round(expiresIn / 60)} min).`
             : `  Type it in the Hinty panel: Voice Assistant -> Agents (valid ${Math.round(expiresIn / 60)} min).`)
+          out('  The panel then shows a 4-digit number: you will type it here.')
           out(c.dim('  Waiting for the code to be entered... (Ctrl+C to cancel)'))
         },
       })
@@ -296,21 +318,26 @@ async function setup(args) {
       out(c.bad(`\n✗ Pairing failed: ${why}`))
       return 1
     }
-    // security review point 4: whoever typed the code now steers this computer, so the person confirms the account
-    out('')
-    let yes
-    if (res.account) {
-      out(`  The code was entered by the Hinty account  ${c.b(res.account)}`)
-      yes = await askYes('  Is this your account? [y/N] ')
-    } else {
-      out(c.warn('  ! The server did not say which account entered the code.'))
-      out('    Open the Hinty panel (Voice Assistant -> Agents) and verify that this computer appears on YOUR account.')
-      yes = await askYes('  Is this computer listed on your own account? [y/N] ')
-    }
-    if (!yes) {
+    // review 2, Z10: whoever typed the code now steers this computer. The panel that typed it shows a 4-digit number;
+    // only the person who typed the code in their OWN panel can copy it here. Anything else unpairs at once.
+    const refuse = async (/** @type {string} */ why) => {
       const told = await tellServerUnpair(api, res.token)
-      out(c.bad(`\n✗ Not confirmed: this computer was ${told ? 'disconnected from that account again' : 'not kept; remove it in the Hinty panel too (the server was not reached)'}. Nothing was saved.`))
+      out(c.bad(`\n✗ ${why} This computer was ${told ? 'disconnected from that account again' : 'not kept; remove it in the Hinty panel too (the server was not reached)'}. Nothing was saved.`))
       return 1
+    }
+    out('')
+    if (res.account) out(`  The code was entered by the Hinty account  ${c.b(res.account)}`)
+    if (!res.checkHash) return refuse('The server did not send the check number (an older Hinty server?).')
+    if (!interactive()) return refuse('Pairing needs a person at this terminal.')
+    let matched = false
+    for (let i = 1; i <= CHECK_TRIES && !matched; i++) {
+      const typed = await ask(`  Type the 4-digit number shown in the Hinty panel: `)
+      if (inputClosed && !typed) break
+      matched = checkMatches(res.token, res.checkHash, typed)
+      if (!matched && i < CHECK_TRIES) out(c.warn(`  That is not the number in the panel (${CHECK_TRIES - i} ${CHECK_TRIES - i === 1 ? 'try' : 'tries'} left).`))
+    }
+    if (!matched) {
+      return refuse('The number did not match the one in the Hinty panel. If you typed the pairing code in your own panel, run `npx hinty-agents` again; if you did not, somebody else may have entered your code.')
     }
     cfg = updateConfig({ api, bridgeToken: res.token, bridgeId: res.bridgeId, label, host: os.hostname(), pairedAt: new Date().toISOString(), entry: cliEntry(), ...(res.account ? { account: res.account } : {}) })
     out(`${c.ok('✓')} Paired. The token is in ${paths().config} (readable by you only).`)
@@ -322,7 +349,7 @@ async function setup(args) {
     out(c.b('Remote switch-on of away mode'))
     for (const l of REMOTE_AWAY_TEXT) out(`  ${l}`)
     const allow = await askYes('Allow switching away mode ON remotely? [y/N] ')
-    cfg = updateConfig({ remoteAwayOn: allow })
+    cfg = updateConfig({ remoteAwayOn: allow, remoteAwayAt: allow ? Date.now() : undefined })
     out(allow ? `${c.ok('✓')} Remote switch-on allowed.` : `${c.ok('✓')} Remote switch-on NOT allowed: only this computer switches away mode on.`)
   }
 
@@ -373,7 +400,15 @@ async function showStatus() {
   out(`Service:  running, pid ${s.pid}, since ${new Date(s.startedAt).toLocaleString()}`)
   out(`Link:     ${s.relay.connected ? c.ok('connected') : c.warn(`not connected${s.relay.lastError ? ` (${oneLine(s.relay.lastError, 60)})` : ''}`)}`)
   out(`Away:     ${awayLine(s.away)}`)
-  if (s.away.remoteRefusedAt) out(`          ${c.warn(`a remote switch-on was refused at ${hhmm(s.away.remoteRefusedAt)} (not allowed on this computer)`)}`)
+  if (s.away.remoteRefusedAt) {
+    const why = s.away.remoteRefusedWhy === 'expired'
+      ? 'more than 12 h since you last switched it on or allowed it here; `away on` or `remote-away on` here opens it again'
+      : 'not allowed on this computer'
+    out(`          ${c.warn(`a remote switch-on was refused at ${hhmm(s.away.remoteRefusedAt)} (${why})`)}`)
+  }
+  if (cfg.remoteAwayOn === true && !s.away.on) {
+    out(`          ${s.away.remoteEnd > Date.now() ? `a remote switch-on is possible until ${new Date(s.away.remoteEnd).toLocaleString()}` : 'a remote switch-on is refused now (more than 12 h since you were last here)'}`)
+  }
   out(`Waiting:  ${s.perms} permission request(s)`)
   if (s.voice) out(`Voice:    ${s.voice.ready ? c.ok('ready') : 'not installed (npx hinty-agents voice install)'}`)
   out(`Sessions: ${s.sessions.length ? '' : 'none'}`)
@@ -413,7 +448,8 @@ async function remoteAwayCmd(arg) {
     return arg === undefined ? 0 : 1
   }
   if (!readConfig()) { out('Not paired yet. Run: npx hinty-agents'); return 1 }
-  updateConfig({ remoteAwayOn: arg === 'on' })
+  // the consent time bounds a remote switch-on: at most 12 h after it (or after the last local `away on`)
+  updateConfig({ remoteAwayOn: arg === 'on', remoteAwayAt: arg === 'on' ? Date.now() : undefined })
   await tellAgents() // a running service says `hello` again with the new `remoteAway`
   if (arg === 'on') {
     for (const l of REMOTE_AWAY_TEXT) out(l)
@@ -574,6 +610,12 @@ async function doctor() {
   const cfg = readConfig()
   line(isPaired(cfg), isPaired(cfg) ? `Paired with ${cfg?.api} as "${oneLine(cfg?.label, 60)}"${cfg?.account ? `, account ${oneLine(cfg.account, 60)}` : ''}` : 'Not paired', 'npx hinty-agents')
   line(null, `Remote switch-on of away mode ${cfg?.remoteAwayOn === true ? 'ALLOWED' : 'not allowed'}`, 'npx hinty-agents remote-away on|off')
+  // the data folder holds the bridge token and the service's key: only you (and SYSTEM) may open it (review 2, Z7)
+  const acc = homeAccess()
+  if (acc.checked) {
+    line(acc.ok, acc.ok ? `Data folder ${homeDir()} is open to you only` : `Data folder ${homeDir()}: ${acc.problem}`,
+      acc.ok ? undefined : process.platform === 'win32' ? 'move it into your user profile (unset HINTY_AGENTS_HOME) or fix its access in Properties -> Security' : `chmod 700 "${homeDir()}" (and make sure you own it)`)
+  }
 
   const cc = claude.detect()
   line(cc.found, cc.found ? `Claude Code ${cc.version}` : 'Claude Code not found')
@@ -599,6 +641,13 @@ async function doctor() {
       for (const n of a.configNotes()) line(null, n)
     } else {
       line(inst.installed ? true : null, inst.installed ? `Grok hooks in ${inst.file}${inst.askShell ? ' (ask-shell ON: Grok fails open)' : ''}` : 'Grok hooks not installed', inst.installed ? undefined : 'npx hinty-agents install grok')
+    }
+    // the hooks start Node by full path (review 2, Z3); after a Node.js update or removal that path may be gone
+    if (inst.installed && inst.node) {
+      const n = inst.node
+      if (n.byName) line(false, `${name} hooks start \`node\` by name (on Windows a node.cmd in the project folder would run instead)`, `npx hinty-agents install ${other}`)
+      else line(n.ok, n.ok ? `${name} hooks start Node.js at ${n.node}` : `${name} hooks start a Node.js that is gone: ${n.node}`,
+        n.ok ? undefined : `npx hinty-agents install ${other}${other === 'codex' ? ' (Codex then asks you to trust the hooks again)' : ''}`)
     }
   }
   for (const other of ['openclaw', 'hermes']) {

@@ -12,7 +12,7 @@
 import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
-import { hooksDir, installScripts, q } from './hookfiles.js'
+import { checkCommandNode, hooksDir, installScripts, nodeCommand, q } from './hookfiles.js'
 import { isAbsPath, parseShim, runSync, start } from '../exec.js'
 
 export const id = 'codex'
@@ -120,8 +120,11 @@ export function queueMessage(sid, text, home) {
   })
 }
 
-/** @param {string} event */
-export const commandFor = (event) => `node ${q(path.join(hooksDir(), 'codex-hook.cjs'))} ${event}`
+/**
+ * The hook command: this Node.js by full path (never `node` by name, security review 2, Z3), the script, the event.
+ * @param {string} event
+ */
+export const commandFor = (event) => `${nodeCommand()} ${q(path.join(hooksDir(), 'codex-hook.cjs'))} ${event}`
 
 /** @param {any} h a handler from hooks.json */
 const isOurs = (h) => !!h && typeof h === 'object' && typeof h.command === 'string' && h.command.includes(MARKER)
@@ -206,6 +209,7 @@ export function install() {
   }
   fs.writeFileSync(r.file, JSON.stringify(merge(r.cfg), null, 2) + '\n')
   steps.push({ step: 'hooks.json', ok: true, message: `${EVENTS.length} hooks added to ${r.file}` })
+  steps.push({ step: 'node', ok: true, message: `the hooks start Node.js by its full path (${nodeCommand()}); if you remove or move this Node.js, run install codex again (doctor checks it)` })
   for (const n of configNotes()) steps.push({ step: 'note', ok: true, message: n })
   steps.push({ step: 'trust', ok: true, message: 'Codex does not run new hooks until you trust them: at its next start it shows "Hooks need review", choose "Trust all and continue" (or review them later with /hooks)' })
   return { ok: true, steps }
@@ -235,17 +239,29 @@ export function uninstall() {
   return { ok: true, steps }
 }
 
-/** @returns {{ installed: boolean, complete: boolean, events: string[], file: string, error: string | null }} */
+/**
+ * @returns {{ installed: boolean, complete: boolean, events: string[], file: string, error: string | null,
+ *   node: { ok: boolean, node: string, byName: boolean } | null }} node: the Node.js our entries start (doctor checks it)
+ */
 export function installed() {
   const r = readHooks()
   const events = []
+  /** @type {{ ok: boolean, node: string, byName: boolean } | null} */
+  let node = null
   if (r.cfg && r.cfg.hooks && typeof r.cfg.hooks === 'object') {
     for (const [ev] of EVENTS) {
       const groups = Array.isArray(r.cfg.hooks[ev]) ? r.cfg.hooks[ev] : []
-      if (groups.some((/** @type {any} */ g) => g && Array.isArray(g.hooks) && g.hooks.some(isOurs))) events.push(ev)
+      for (const g of groups) {
+        for (const h of (g && Array.isArray(g.hooks) ? g.hooks : [])) {
+          if (!isOurs(h)) continue
+          if (!events.includes(ev)) events.push(ev)
+          const n = checkCommandNode(h.command)
+          if (!node || (node.ok && !n.ok)) node = n
+        }
+      }
     }
   }
-  return { installed: events.length > 0, complete: events.length === EVENTS.length, events, file: r.file, error: r.error }
+  return { installed: events.length > 0, complete: events.length === EVENTS.length, events, file: r.file, error: r.error, node }
 }
 
 /**

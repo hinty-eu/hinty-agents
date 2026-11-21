@@ -6,6 +6,7 @@ import crypto from 'node:crypto'
 import fs from 'node:fs'
 import { createRequire } from 'node:module'
 import path from 'node:path'
+import { fileURLToPath } from 'node:url'
 import { pipeline } from 'node:stream/promises'
 import { Readable, Transform } from 'node:stream'
 import { ensureHome, readJson, writeJson } from '../store.js'
@@ -112,15 +113,22 @@ export async function downloadFile(f, dir, onProgress) {
   return true
 }
 
+/** The voice folder's package.json and lock file, shipped with this package (every package pinned with `integrity`). */
+export const VOICE_PACKAGE = () => fileURLToPath(new URL('./voice-package.json', import.meta.url))
+export const VOICE_LOCK = () => fileURLToPath(new URL('./voice-package-lock.json', import.meta.url))
+
 function installSherpa() {
   fs.mkdirSync(voiceDir(), { recursive: true })
-  const pj = path.join(voiceDir(), 'package.json')
-  if (!fs.existsSync(pj)) fs.writeFileSync(pj, '{"name":"hinty-agents-voice","private":true,"version":"0.0.0"}\n')
+  // security review point 11 / review 2: the exact tree from our lock file (sherpa-onnx-node and its per-platform
+  // packages, each with a sha512 `integrity` npm checks), installed with `npm ci --ignore-scripts`: no version is picked
+  // at install time and no package script runs (sherpa-onnx-node 2.0.2 ships prebuilt binaries and needs none)
+  fs.copyFileSync(VOICE_PACKAGE(), path.join(voiceDir(), 'package.json'))
+  fs.copyFileSync(VOICE_LOCK(), path.join(voiceDir(), 'package-lock.json'))
   // npm without a shell (security review points 6 and 11): node + npm-cli.js, the folder as one argument (a space in
   // the user name no longer splits it, a `&` is not run by cmd.exe), started in the voice folder
   const npm = npmLaunch()
   if (!npm) throw new Error('npm was not found next to this Node.js or on PATH')
-  const r = runSync(npm, ['install', '--prefix', voiceDir(), '--save-exact', `sherpa-onnx-node@${SHERPA_VERSION}`, '--no-audit', '--no-fund', '--loglevel=error'],
+  const r = runSync(npm, ['ci', '--prefix', voiceDir(), '--ignore-scripts', '--no-audit', '--no-fund', '--loglevel=error'],
     { stdio: 'inherit', cwd: voiceDir() })
   if (r.status !== 0 || !sherpaInstalled()) throw new Error('npm could not install sherpa-onnx-node (see the message above)')
 }

@@ -1,11 +1,29 @@
 // @ts-check
 // Pairing like a TV: connect without a token, ask for a code, the person types it in the Hinty panel, the server
 // hands this computer its bridge token. The token is stored in ~/.hinty-agents/config.json (owner-only) only after the
-// person confirmed the account it was paired with (security review point 4: a code typed in by somebody else must not
-// tie this computer to their account): `paired {token, bridgeId, account?}`, `account` = the masked e-mail of the
-// account that typed the code (e.g. `a***@g***.com`), untrusted text, so it is checked and cleaned before it is shown.
+// person proved that the code went into THEIR panel (security review point 4, review 2 Z10: a code read off a shared
+// screen and typed into somebody else's account must not tie this computer to that account):
+// `paired {token, bridgeId, account?, checkHash}`. The panel that typed the code shows a 4-digit number (`check`, only
+// in the answer of `POST /agents-link/claim`); the bridge gets `checkHash = sha256(token + ":" + check)` and asks the
+// person to type the number they see. Only the account that typed the code can see it. `account` (the masked e-mail,
+// e.g. `a***@g***.com`) is shown as extra information; it is untrusted text, checked and cleaned before it is shown.
+import crypto from 'node:crypto'
 import { io as ioDefault } from 'socket.io-client'
 import { oneLine } from './text.js'
+
+/**
+ * Is `typed` the number shown in the panel? sha256(token + ":" + typed) against `checkHash`, compared in constant time.
+ * Only 4 digits count. Pure.
+ * @param {string} token @param {string | null} checkHash @param {unknown} typed
+ */
+export function checkMatches(token, checkHash, typed) {
+  const t = String(typed ?? '').trim()
+  if (!checkHash || !/^[0-9a-f]{64}$/.test(checkHash) || !/^\d{4}$/.test(t)) return false
+  const got = crypto.createHash('sha256').update(`${token}:${t}`, 'utf8').digest()
+  return crypto.timingSafeEqual(got, Buffer.from(checkHash, 'hex'))
+}
+
+export const CHECK_TRIES = 3
 
 /** The code alphabet of the server (kontrakt-v2 `pair_code`): 6 characters, no 0/O/1/I/L/B/8/S/5/2/Z. */
 export const CODE_RE = /^[ACDEFGHJKMNPQRTUVWXY34679]{6}$/
@@ -23,7 +41,7 @@ export function cleanAccount(v) {
 /**
  * @param {{ api: string, label?: string, host?: string, io?: typeof ioDefault, maxCodes?: number,
  *   onCode: (code: string, expiresIn: number) => void }} o
- * @returns {Promise<{ token: string, bridgeId: string, account: string | null }>}
+ * @returns {Promise<{ token: string, bridgeId: string, account: string | null, checkHash: string | null }>}
  */
 export function pair(o) {
   const io = o.io || ioDefault
@@ -36,7 +54,7 @@ export function pair(o) {
     const s = io(`${o.api.replace(/\/+$/, '')}/agents-link`, {
       transports: ['websocket'], auth: {}, reconnection: true, reconnectionAttempts: 5, forceNew: true, timeout: 15000,
     })
-    /** @param {Error | null} err @param {{ token: string, bridgeId: string, account: string | null }} [val] */
+    /** @param {Error | null} err @param {{ token: string, bridgeId: string, account: string | null, checkHash: string | null }} [val] */
     const finish = (err, val) => {
       if (done) return
       done = true
@@ -65,7 +83,8 @@ export function pair(o) {
         typeof p.bridgeId !== 'string' || !/^[0-9a-f]{24}$/.test(p.bridgeId)) {
         return finish(new Error('bad_pairing_answer'))
       }
-      finish(null, { token: p.token, bridgeId: p.bridgeId, account: cleanAccount(p.account) })
+      const checkHash = typeof p.checkHash === 'string' && /^[0-9a-f]{64}$/.test(p.checkHash) ? p.checkHash : null
+      finish(null, { token: p.token, bridgeId: p.bridgeId, account: cleanAccount(p.account), checkHash })
     })
     s.on('pair_error', (/** @type {any} */ p) => finish(new Error(`pair_error:${oneLine(p && p.reason, 30)}`)))
     s.on('connect_error', (err) => {

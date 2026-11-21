@@ -238,6 +238,21 @@ const POLL_FRESH_MS = 60 * 1000
 const ACK_WAIT_MS = 10 * 1000
 const SAFETY_MS = 7000
 
+/**
+ * Traces of Hermes's own redaction and display clean-up (security review 2, Z2). The plugin only ever sees Hermes's
+ * DISPLAY copy of a command (`redact_approval_display(command, force=True)`), never the raw one, and Hermes hides
+ * secrets there the way our old mask did: what runs may be inside the hidden part. Every marker Hermes 0.23 writes
+ * (agent/redact.py, agent/redact_approval_display.py): `***` (masked value, `KEY=***`, `:***@`), `head...tail`
+ * (mask_secret), `«redacted:…»` / `«redacted-secret»`, `[REDACTED PRIVATE KEY]`, `[redacted: nesting limit]`,
+ * `[redaction-unavailable]`, `⟨+N blank lines⟩` / `⟨+N whitespace chars⟩` / `⟨\uXXXX ×N⟩`. A card with any of them is
+ * incomplete (`part`): deny from the glasses, allow only in Hermes's own prompt. `git diff a...b` and `go test ./...`
+ * pay the same price.
+ */
+export const HERMES_TRACE = /\*\*\*|\.\.\.|…|«\s*redact|\[\s*redact|⟨/i
+
+/** @param {string} s */
+export const hermesRedacted = (s) => HERMES_TRACE.test(String(s || ''))
+
 /** @typedef {import('../service.js').Service} Service */
 
 export class HermesLink {
@@ -302,8 +317,10 @@ export class HermesLink {
     const description = typeof body.description === 'string' ? body.description : ''
     const tool = typeof body.pattern_key === 'string' && body.pattern_key ? body.pattern_key : 'terminal'
     const entry = { rid: '' }
+    // complete only with a command and without any trace of Hermes's redaction in what we were given (Z2)
+    const complete = !!command.trim() && !hermesRedacted(command) && !hermesRedacted(description)
     const answer = await this.service.requestPerm(
-      { sid, cwd: '', tool, input: { request_id: request, command, description }, agentId: null, agentType: '', cardText: `${description ? description + '\n' : ''}${command}`, cardComplete: !!command.trim(), label: 'hermes' },
+      { sid, cwd: '', tool, input: { request_id: request, command, description }, agentId: null, agentType: '', cardText: `${description ? description + '\n' : ''}${command}`, cardComplete: complete, label: 'hermes' },
       ctl, { agent: 'hermes', ttlMs: Math.min(ttlS, 3600) * 1000, onCreate: (p) => { entry.rid = p.rid; if (request) this.pendingPerms.set(request, p.rid) } },
     )
     if (request) this.pendingPerms.delete(request)

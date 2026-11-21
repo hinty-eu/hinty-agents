@@ -1,6 +1,6 @@
 {
   "name": "hinty-agents",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "description": "Supervise your AI coding agents (Claude Code first) from Hinty smart-glasses and the Hinty web panel: approve or deny permission prompts, see session status, send follow-up instructions.",
   "type": "module",
   "bin": {
@@ -14,7 +14,9 @@
     "hooks/",
     ".claude-plugin/",
     "README.md",
-    "LICENSE"
+    "LICENSE",
+    "!**/__pycache__/**",
+    "!**/*.pyc"
   ],
   "engines": {
     "node": ">=20"
