@@ -1,5 +1,22 @@
 # Changelog
 
+## 0.3.2
+
+Small fixes after the fourth review.
+
+- `uninstall --purge`: the `.hinty-agents-home` marker is written only when the data folder did not exist or was empty
+  at its first use, and it now lists the top-level entries hinty-agents created. A `HINTY_AGENTS_HOME` that points to a
+  folder with other things gets a warning and no marker. Purge removes only listed entries and, inside a sub-folder, only
+  our own files (voice models by name, size and SHA-256 of the registry, our partial downloads, our three hook scripts,
+  our OpenClaw and Hermes files, the voice package); the folder goes only when we created it and it is empty. In `app/`
+  `.tmp-*`, `.old-*` and `.manifests` are removed only in the shape we make them, and old versions only with our
+  `package.json`. Program copies are no longer removed when the data folder is protected.
+- `HINTY_AGENTS_HOME` with a part that ends in a space, a tab or a dot is ignored with a warning (service and hooks),
+  because Windows tools treat it as another folder.
+- OpenClaw: the copy of OpenClaw's message clean-up runs in one pass (same result, checked against the original
+  expressions on 200 000 random texts); a message of 8000 characters takes a few milliseconds instead of 0.4 s.
+- README: the manifest of the program copy checks consistency, it is not a firewall.
+
 ## 0.3.1
 
 Security fixes after the third review.

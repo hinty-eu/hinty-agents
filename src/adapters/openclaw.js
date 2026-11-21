@@ -403,7 +403,69 @@ const COMMAND_START = /(?:^|\s)(?:\/(?!\/)|!)/u
  */
 export function openclawStrip(text) {
   if (!text) return ''
-  return (text.includes('[Current message - respond to this]') ? text.slice(text.indexOf('[Current message - respond to this]') + 35).trimStart() : text).replace(/\[[^\]]+\]\s*/g, '').replace(/^[ \t]*[A-Za-z0-9+()\-_. ]+:\s*/gm, '').replace(/\\n/g, ' ').replace(/\s+/g, ' ').trim()
+  let t = text.includes('[Current message - respond to this]') ? text.slice(text.indexOf('[Current message - respond to this]') + 35).trimStart() : text
+  // OpenClaw's three clean-up expressions (brackets with their content, a "label:" at a line start, a written \n) as
+  // single passes (security review 4, A4): the expressions backtrack, and a message of 8000 characters took 0.4 s.
+  // test/openclaw-strip.test.js compares both on random input. Without `]`, `:` or a backslash there is nothing to do.
+  if (t.includes(']')) t = removeBrackets(t)
+  if (t.includes(':')) t = removeLabels(t)
+  if (t.includes('\\')) t = t.replace(/\\n/g, ' ')
+  return t.replace(/\s+/g, ' ').trim()
+}
+
+const isSpace = (/** @type {string} */ ch) => /\s/.test(ch)
+const isLineBreak = (/** @type {string} */ ch) => ch === '\n' || ch === '\r' || ch === ' ' || ch === ' '
+const LABEL_CHAR = /[A-Za-z0-9+()\-_. ]/
+
+// brackets with their content and the white space after them, as OpenClaw's expression removes them, in one pass
+/** @param {string} s */
+function removeBrackets(s) {
+  const n = s.length
+  let out = '', from = 0, i = 0
+  while (i < n) {
+    const open = s.indexOf('[', i)
+    if (open < 0) break
+    const close = s.indexOf(']', open + 1)
+    if (close < 0) break
+    if (close === open + 1) { i = open + 1; continue } // "[]": at least one character is needed between
+    let e = close + 1
+    while (e < n && isSpace(s[e])) e++
+    out += s.slice(from, open)
+    from = i = e
+  }
+  return out + s.slice(from)
+}
+
+// a "label:" at a line start, as OpenClaw's expression (multi-line mode) removes it, in one pass
+/** @param {string} s */
+function removeLabels(s) {
+  const n = s.length
+  let out = '', from = 0, pos = 0
+  while (pos <= n) {
+    // the next line start at or after pos (the start of the text, or right after a line break)
+    if (pos > 0 && !isLineBreak(s[pos - 1])) {
+      while (pos < n && !isLineBreak(s[pos])) pos++
+      pos++
+      if (pos > n) break
+    }
+    const st = pos
+    let k = st, lastTab = -1, firstWord = -1
+    for (; k < n; k++) {
+      const ch = s[k]
+      if (ch === '\t') lastTab = k
+      else if (LABEL_CHAR.test(ch)) { if (ch !== ' ' && firstWord < 0) firstWord = k }
+      else break
+    }
+    // [ \t]* then label characters up to a colon; a tab is no label character, so every tab belongs to the first part
+    const bodyStart = lastTab >= st ? lastTab + 1 : st
+    if (k < n && s[k] === ':' && k > bodyStart && (lastTab < 0 || firstWord < 0 || firstWord > lastTab)) {
+      let e = k + 1
+      while (e < n && isSpace(s[e])) e++
+      out += s.slice(from, st)
+      from = pos = e
+    } else pos = st + 1
+  }
+  return out + s.slice(from)
 }
 
 /** @param {string} c a character @param {RegExp} re does it become one of these under compatibility normalisation? */

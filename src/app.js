@@ -6,7 +6,7 @@
 import crypto from 'node:crypto'
 import fs from 'node:fs'
 import path from 'node:path'
-import { ensureHome, homeDir, narrowHome } from './store.js'
+import { ensureHome, homeDir, narrowHome, noteCreated } from './store.js'
 import { activeRoot, packageRoot, setActiveRoot } from './root.js'
 
 export const appBase = () => path.join(homeDir(), 'app')
@@ -86,6 +86,7 @@ function saveManifest(version, m) {
   const d = manifestDir()
   const fresh = !fs.existsSync(d)
   fs.mkdirSync(d, { recursive: true, mode: 0o700 })
+  noteCreated(d)
   if (fresh) narrowHome(d)
   const tmp = `${manifestFile(version)}.${process.pid}.tmp`
   fs.writeFileSync(tmp, JSON.stringify(m) + '\n', { mode: 0o600 })
@@ -148,9 +149,9 @@ export function removeProgramCopies() {
   try { names = fs.readdirSync(base) } catch { return { removed, kept, failed } }
   for (const n of names) {
     const p = path.join(base, n)
-    const pkg = readPkg(p)
-    const ours = n === '.manifests' || n.startsWith('.tmp-') || n.startsWith('.old-') ||
-      (/^\d+\.\d+\.\d+([-+][0-9A-Za-z.-]+)?$/.test(n) && !!pkg && pkg.name === 'hinty-agents' && pkg.version === n && !fs.existsSync(path.join(p, '.git')))
+    let manifests = false
+    if (n === '.manifests') { try { manifests = fs.readdirSync(p).every((x) => MANIFEST_FILE.test(x)) } catch { manifests = false } }
+    const ours = manifests || TEMP_COPY.test(n) || isProgramCopy(n)
     if (!ours) { kept.push(n); continue }
     try { fs.rmSync(p, { recursive: true, force: true }); removed.push(n) } catch { failed.push(n) }
   }
@@ -226,6 +227,17 @@ const cmpVersion = (/** @type {string} */ a, /** @type {string} */ b) => {
   return 0
 }
 
+/** names of the temporary folders ensureApp makes: .tmp-<pid>-<time>, .old-<pid>-<time> */
+const TEMP_COPY = /^\.(?:tmp|old)-\d+-[0-9a-z]+$/
+/** a file of .manifests/: <version>.json (or its unfinished temporary file) */
+const MANIFEST_FILE = /^\d+\.\d+\.\d+[-+.0-9A-Za-z]*?\.json(?:\.\d+\.tmp)?$/
+/** is app/<name> a program copy of ours: a version folder with our package.json of that version, no .git @param {string} name */
+function isProgramCopy(name) {
+  const p = path.join(appBase(), name)
+  const pkg = readPkg(p)
+  return /^\d+\.\d+\.\d+([-+][0-9A-Za-z.-]+)?$/.test(name) && !!pkg && pkg.name === 'hinty-agents' && pkg.version === name && !fs.existsSync(path.join(p, '.git'))
+}
+
 /**
  * Remove old versions after a successful switch: the current one and the newest other one stay (a service or an open
  * Claude Code session may still use the previous one); unfinished temporary folders go.
@@ -237,11 +249,12 @@ export function pruneOld(current) {
   let names = []
   try { names = fs.readdirSync(base) } catch { return [] }
   for (const n of names) {
-    if (n.startsWith('.tmp-') || n.startsWith('.old-')) {
+    if (TEMP_COPY.test(n)) {
       try { fs.rmSync(path.join(base, n), { recursive: true, force: true }); removed.push(n) } catch { /* in use */ }
     }
   }
-  const versions = names.filter((n) => /^\d+\.\d+\.\d+/.test(n) && n !== current).sort(cmpVersion).reverse()
+  // only version folders that hold our own package.json of that version (review 4, A1: app/ may hold other things)
+  const versions = names.filter((n) => /^\d+\.\d+\.\d+/.test(n) && n !== current && isProgramCopy(n)).sort(cmpVersion).reverse()
   for (const n of versions.slice(1)) {
     try { fs.rmSync(path.join(base, n), { recursive: true, force: true }); removed.push(n) } catch { /* in use: next time */ }
   }
@@ -278,6 +291,7 @@ export function ensureApp(o = {}) {
   const version = String(pkg.version)
   ensureHome()
   fs.mkdirSync(base, { recursive: true, mode: 0o700 })
+  noteCreated(base)
   const target = path.join(base, version)
   let copied = false
   // an existing folder of this version counts only when it matches the manifest we wrote when we made it (6b)

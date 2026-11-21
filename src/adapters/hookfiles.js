@@ -8,7 +8,7 @@ import path from 'node:path'
 import { spawnSync } from 'node:child_process'
 import { activeRoot } from '../root.js'
 import { childEnv, powershellExe, sysExe, which } from '../exec.js'
-import { ensureHome, homeDir } from '../store.js'
+import { ensureHome, homeDir, noteCreated } from '../store.js'
 
 export const SCRIPTS = ['common.cjs', 'codex-hook.cjs', 'grok-hook.cjs']
 
@@ -20,6 +20,7 @@ export function installScripts() {
   ensureHome()
   const dest = hooksDir()
   fs.mkdirSync(dest, { recursive: true })
+  noteCreated(dest)
   for (const f of SCRIPTS) fs.copyFileSync(path.join(sourceDir(), f), path.join(dest, f))
   return dest
 }

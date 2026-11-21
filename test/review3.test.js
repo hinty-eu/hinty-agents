@@ -24,7 +24,7 @@ import * as codex from '../src/adapters/codex.js'
 import * as grok from '../src/adapters/grok.js'
 import { appBase, buildManifest, copyPackage, ensureApp, manifestFile, removeProgramCopies, verifyCopy } from '../src/app.js'
 import { setActiveRoot } from '../src/root.js'
-import { HOME_MARKER, ensureHome, homeAccess, protectedFolder, purgeBlocker, purgeHome } from '../src/store.js'
+import { HOME_MARKER, noteCreated, ensureHome, homeAccess, protectedFolder, purgeBlocker, purgeHome } from '../src/store.js'
 import { writeDaemon } from './helpers.js'
 import { startGateway } from './fixtures/fake-gateway.js'
 
@@ -405,7 +405,8 @@ test('6a: a new, empty or default folder gets the marker; a folder that already 
   const ours = tmp()
   fs.writeFileSync(path.join(ours, 'config.json'), '{"v":1,"api":"x"}')
   fs.mkdirSync(path.join(ours, 'hooks'))
-  withHome(ours, () => { ensureHome(); assert.equal(fs.existsSync(path.join(ours, HOME_MARKER)), true, 'a 0.3.0 folder with only our entries') })
+  // review 4, A1: a folder that was not empty at the first use is not marked, even when every entry is named like ours
+  withHome(ours, () => { ensureHome(); assert.equal(fs.existsSync(path.join(ours, HOME_MARKER)), false) })
 })
 
 test('6a: purge of a folder that is not ours removes only entries whose content proves they are ours', () => {
@@ -431,7 +432,9 @@ test('6a: purge of our folder removes our entries; it removes the folder only wh
   withHome(h, () => {
     ensureHome()
     fs.writeFileSync(path.join(h, 'config.json'), '{"v":1,"api":"x"}')
+    noteCreated(path.join(h, 'config.json'))
     fs.mkdirSync(path.join(h, 'models', 'parakeet-v3'), { recursive: true })
+    noteCreated(path.join(h, 'models'))
     fs.writeFileSync(path.join(h, 'later-added.txt'), 'the person put this here later')
     let r = purgeHome()
     assert.equal(r.folderGone, false)

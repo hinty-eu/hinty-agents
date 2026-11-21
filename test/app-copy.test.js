@@ -104,7 +104,10 @@ test('a broken copy (no dependencies) is replaced atomically, not trusted', () =
 test('old versions are removed after the switch: the current and the newest other one stay', () => {
   const home = tmp()
   withHome(home, '0', () => {
-    for (const v of ['0.1.0', '0.2.0', '0.2.5', '.tmp-123-x']) fs.mkdirSync(path.join(home, 'app', v), { recursive: true })
+    for (const v of ['0.1.0', '0.2.0', '0.2.5', '.tmp-123-x']) {
+      fs.mkdirSync(path.join(home, 'app', v), { recursive: true })
+      if (v[0] !== '.') fs.writeFileSync(path.join(home, 'app', v, 'package.json'), JSON.stringify({ name: 'hinty-agents', version: v }))
+    }
     const r = ensureApp()
     assert.deepEqual(versions(appBase()).sort(), ['0.2.5', VERSION].sort())
     assert.deepEqual(r.removed.sort(), ['.tmp-123-x', '0.1.0', '0.2.0'].sort())

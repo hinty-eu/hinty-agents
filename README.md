@@ -92,7 +92,13 @@ The Claude Code mod writes an instruction's id and length (not its text) to Clau
 
 - **The relay is trusted while away mode is on** (table above). Masking secrets is best effort; content crosses the Hinty
   server in transit.
-- **`HINTY_AGENTS_HOME` from the environment is trusted** when it is an absolute path. Whoever sets it in your agent's
+- **The manifest of the program copy checks consistency, it is not a firewall.** It catches a copy that is incomplete,
+  old or changed later (the full check runs in `start`, `install` and `doctor`); it does not stop somebody who can
+  write to the data folder before its first use, and the service started from a hook is checked by code from the same
+  copy. With your own `HINTY_AGENTS_HOME` in a shared folder (one other accounts can reach) the protection depends on
+  the folder's permissions. The recommended place is the default `~/.hinty-agents`.
+- **`HINTY_AGENTS_HOME` from the environment is trusted** when it is an absolute path without a part that ends in a
+  space, a tab or a dot (Windows tools read such a name as another folder; the value is then ignored with a warning). Whoever sets it in your agent's
   environment (a `direnv` file, an editor workspace setting) chooses the data folder the hooks use, including the
   service they start. Do not let a project set it.
 - **The Claude Code plugin starts `node` by name** (its `hooks.json` cannot hold a per-computer path). Claude Code runs a
@@ -120,13 +126,13 @@ Requirements: Node.js 20+, Claude Code (`claude`) with mods enabled (default sin
 Run it with `npx`. **Pin the version** (the hooks run on your machine, so you decide when to update):
 
 ```bash
-npx hinty-agents@0.3.1
+npx hinty-agents@0.3.2
 ```
 
 Or straight from GitHub (a tag, not a branch):
 
 ```bash
-npx github:hinty-eu/hinty-agents#v0.3.1
+npx github:hinty-eu/hinty-agents#v0.3.2
 ```
 
 **Where it lives.** `npx` runs from npm's cache, which npm may clean at any time. So setup (and `start`, `install`)
@@ -381,8 +387,12 @@ It removes the hooks and plugins of every agent you installed (Claude Code plugi
 Hermes), unpairs this computer (revokes the token), stops the service, deletes `~/.hinty-agents/app/` and asks whether
 to delete the rest of `~/.hinty-agents` too (`--purge` deletes it without asking, `--keep-data` keeps it). Only what
 hinty-agents created is deleted: the folder itself goes only when it carries the `.hinty-agents-home` marker (written
-when hinty-agents creates the folder or finds it empty) and nothing else is left in it; a `HINTY_AGENTS_HOME` that is
-your home folder, a drive or a system folder is never emptied. `npx` keeps
+only when hinty-agents creates the folder or finds it empty; it lists the entries hinty-agents made) and nothing else is
+left in it. A `HINTY_AGENTS_HOME` that points to a folder which already holds other things gets no marker (a warning says
+so), and `--purge` removes from it only the files hinty-agents made (the checksum-verified voice model files, its hook
+scripts, its settings and logs), never a `models`, `app` or `hooks` folder as a whole. A `HINTY_AGENTS_HOME` that is
+your home folder, a drive or a system folder is never emptied. Point `HINTY_AGENTS_HOME` at an empty or new folder, or
+leave it unset. `npx` keeps
 its own cache; `npm cache clean --force` empties it.
 
 One at a time:

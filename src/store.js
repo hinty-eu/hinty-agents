@@ -1,6 +1,7 @@
 // @ts-check
 // Files in ~/.hinty-agents (or $HINTY_AGENTS_HOME): config.json (server, bridge token), daemon.json (local port and
 // secret of the running service), daemon.lock, daemon.log. The folder is readable by the user only.
+import crypto from 'node:crypto'
 import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
@@ -9,6 +10,8 @@ import { fileURLToPath } from 'node:url'
 import { isAbsPath, sysExe } from './exec.js'
 import { PV } from './localauth.js'
 import { activeRoot } from './root.js'
+import { SCRIPTS } from './adapters/hookfiles.js'
+import { MODELS } from './stt/models.js'
 
 export const DEFAULT_API = 'https://api.v1.hinty.eu'
 
@@ -19,13 +22,20 @@ let warnedHome = false
  */
 export function homeDir() {
   const own = process.env.HINTY_AGENTS_HOME
-  if (own && isAbsPath(own)) return own
+  if (own && isAbsPath(own) && !badPathPart(path.resolve(own))) return own
   if (own && !warnedHome) {
     warnedHome = true
-    process.emitWarning('HINTY_AGENTS_HOME is not an absolute path; it is ignored and ~/.hinty-agents is used', { code: 'HINTY_AGENTS_HOME' })
+    // a part of the path that ends in a space, a tab or a dot is another folder for Windows tools (icacls, Explorer)
+    // than for Node (security review 4, A3): such a value is refused like a relative one
+    process.emitWarning(isAbsPath(own)
+      ? 'HINTY_AGENTS_HOME has a part that ends in a space, a tab or a dot; it is ignored and ~/.hinty-agents is used'
+      : 'HINTY_AGENTS_HOME is not an absolute path; it is ignored and ~/.hinty-agents is used', { code: 'HINTY_AGENTS_HOME' })
   }
   return path.join(os.homedir(), '.hinty-agents')
 }
+
+/** Does any part of the (resolved) path end in a space, a tab or a dot? @param {string} p */
+export const badPathPart = (p) => p.split(/[\\/]/).some((seg) => /[ \t.]$/.test(seg))
 
 export const paths = () => {
   const h = homeDir()
@@ -54,7 +64,9 @@ export const homeAccess = () => homeAccessState
 export function ensureHome() {
   const h = homeDir()
   if (homeChecked !== h) {
-    const existed = fs.existsSync(h)
+    // new or empty at the first use = ours; a folder that already holds things is only ever cleaned entry by entry
+    let fresh = true
+    try { fresh = fs.readdirSync(h).length === 0 } catch { /* not there yet */ }
     fs.mkdirSync(h, { recursive: true, mode: 0o700 })
     homeChecked = h
     // a HINTY_AGENTS_HOME that is your home folder, a drive or a system folder never has its access changed (6a)
@@ -62,7 +74,7 @@ export function ensureHome() {
     homeAccessState = prot
       ? { ok: false, checked: true, problem: `HINTY_AGENTS_HOME is not a folder of its own (${prot}), so its access was not changed` }
       : narrowHome(h)
-    markHome(h, existed)
+    markHome(h, fresh)
   } else {
     fs.mkdirSync(h, { recursive: true, mode: 0o700 })
   }
@@ -73,8 +85,9 @@ export function ensureHome() {
 // Whose folder is it? (`uninstall --all --purge` deletes only what is ours)
 // ------------------------------------------------------------------------------------------------
 
-/** Written into the data folder when it is ours: created by us, empty at first use, the default path, or holding only
- * our own entries (a 0.3.0 folder). A folder that already held other things never gets it. */
+/** Written into the data folder only when we created it or it was empty at the first use (security review 4, A1). It
+ * lists the top-level entries WE created (`noteCreated`); `uninstall --purge` removes only those. A folder that already
+ * held other things never gets it. (0.3.0 and 0.3.1 wrote a plain-text marker without a list; it is read as "no list".) */
 export const HOME_MARKER = '.hinty-agents-home'
 
 /** Every top-level entry this program creates in the data folder (and the temporary files of writeJson). */
@@ -120,19 +133,66 @@ export function protectedFolder(dir) {
   return ''
 }
 
-/** @param {string} h @param {boolean} existed */
-function markHome(h, existed) {
+let warnedExisting = false
+/** @param {string} h @param {boolean} fresh the folder did not exist or was empty before this first use */
+function markHome(h, fresh) {
   const marker = path.join(h, HOME_MARKER)
   try {
     if (fs.existsSync(marker) || protectedFolder(h)) return
-    if (existed && canon(h) !== canon(path.join(os.homedir(), '.hinty-agents')) && !fs.readdirSync(h).every(isOurEntry)) return
-    fs.writeFileSync(marker, 'This folder belongs to hinty-agents (its data folder). `npx hinty-agents uninstall --all --purge` deletes it.\n', { mode: 0o600, flag: 'wx' })
-  } catch { /* unmarked: purge then removes nothing by name */ }
+    if (!fresh) {
+      if (!warnedExisting && canon(h) !== canon(path.join(os.homedir(), '.hinty-agents'))) {
+        warnedExisting = true
+        process.emitWarning('HINTY_AGENTS_HOME points to an existing folder; uninstall --purge will remove only files hinty-agents created', { code: 'HINTY_AGENTS_HOME' })
+      }
+      return
+    }
+    const note = 'This folder was created for hinty-agents (its data folder). `entries` lists what hinty-agents itself created in it; `npx hinty-agents uninstall --all --purge` removes only those.'
+    fs.writeFileSync(marker, JSON.stringify({ v: 2, note, entries: [] }, null, 2) + '\n', { mode: 0o600, flag: 'wx' })
+  } catch { /* unmarked: purge then removes only what its content proves is ours */ }
+}
+
+/** @param {string} h @returns {{ v: 2, note: string, entries: string[] } | 'legacy' | null} */
+function readMarker(h) {
+  let raw
+  try { raw = fs.readFileSync(path.join(h, HOME_MARKER), 'utf8') } catch { return null }
+  try {
+    const j = JSON.parse(raw)
+    if (j && j.v === 2 && Array.isArray(j.entries)) return { v: 2, note: String(j.note || ''), entries: j.entries.filter((/** @type {unknown} */ e) => typeof e === 'string') }
+  } catch { /* the plain-text marker of 0.3.0 / 0.3.1 */ }
+  return 'legacy'
+}
+
+const noted = new Set()
+/**
+ * Record that this program created `file` inside the data folder: its top-level entry goes into the marker's list.
+ * Called where a file or folder of ours is made (config, daemon files, hooks, openclaw, hermes, models, voice, app, log).
+ * Nothing happens without a v2 marker (a folder we did not create) or for a path outside the data folder.
+ * @param {string} file
+ */
+export function noteCreated(file) {
+  try {
+    const h = homeDir()
+    const rel = path.relative(h, file)
+    if (!rel || rel.startsWith('..') || path.isAbsolute(rel)) return
+    const top = rel.split(/[\\/]/)[0]
+    if (top === HOME_MARKER || !isOurEntry(top)) return
+    const key = `${h}|${top}`
+    if (noted.has(key)) return
+    const m = readMarker(h)
+    if (!m || m === 'legacy') return
+    noted.add(key)
+    if (m.entries.includes(top)) return
+    m.entries.push(top)
+    const marker = path.join(h, HOME_MARKER)
+    const tmp = `${marker}.${process.pid}.tmp`
+    fs.writeFileSync(tmp, JSON.stringify(m, null, 2) + '\n', { mode: 0o600 })
+    fs.renameSync(tmp, marker)
+  } catch { /* an entry left out of the list is simply not purged */ }
 }
 
 /**
- * In a folder without our marker an entry counts as ours only when its content says so (its name alone could be a
- * coincidence: a `models` or `hooks` folder of somebody else's).
+ * Without a v2 marker (a folder that already held other things, or a 0.3.0 / 0.3.1 folder) an entry counts as ours only
+ * when its content says so (its name alone could be a coincidence: a `models` or `hooks` folder of somebody else's).
  * @param {string} h @param {string} n
  */
 function provablyOurs(h, n) {
@@ -146,34 +206,120 @@ function provablyOurs(h, n) {
       case 'daemon.json': { const j = readJson(p); return !!j && Number.isInteger(j.pid) && (j.pv !== undefined || typeof j.secret === 'string') }
       case 'daemon.lock': return /^\d+\s*$/.test(fs.readFileSync(p, 'utf8'))
       case 'daemon.log': case 'daemon.log.1': return /^\d{4}-\d\d-\d\dT[\d:.]+Z \w/.test(fs.readFileSync(p, 'utf8').slice(0, 64))
-      case 'voice.json': return !!readJson(p)
+      case 'voice.json': { const j = readJson(p); return !!j && j.v === 1 && typeof j.model === 'string' && Object.hasOwn(MODELS, j.model) }
       case 'hooks': return /Hinty Agents/.test(text('common.cjs'))
-      case 'openclaw': return has('approver.json') || has('tokens.json') || has('device.json') || has('orphans.json')
-      case 'hermes': return has('backup.json')
+      case 'openclaw': return fs.readdirSync(p).some((x) => ownJsonFile(p, x))
+      case 'hermes': return ownJsonFile(p, 'backup.json')
       case 'voice': return /"hinty-agents-voice"/.test(text('package.json'))
-      case 'models': return fs.readdirSync(p).length > 0 && fs.readdirSync(p).every((x) => /^(parakeet|whisper|silero)[\w.-]*$/.test(x))
-      default: return /^(?:config|daemon|voice)\.json\.\d+\.tmp$/.test(n)
+      case 'models': return fs.readdirSync(p).some((x) => Object.hasOwn(MODELS, x))
+      case 'app': return true // only an empty folder is removed
+      default: return TMP_NAME.test(n)
     }
   } catch { return false }
 }
 
+const TMP_NAME = /^(?:config|daemon|voice)\.json\.\d+\.tmp$/
+const isIdentity = (/** @type {any} */ j) => j.version === 1 && typeof j.deviceId === 'string' && typeof j.publicKeyPem === 'string' && typeof j.privateKeyPem === 'string'
+/** the JSON files we write in openclaw/ and hermes/, and what proves a file of that name is ours */
+const OWN_JSON = {
+  'approver.json': isIdentity, 'writer.json': isIdentity, 'device.json': isIdentity,
+  'tokens.json': (/** @type {any} */ j) => j.v === 2 && typeof j.url === 'string',
+  'orphans.json': (/** @type {any} */ j) => j.v === 1 && Array.isArray(j.devices),
+  'backup.json': (/** @type {any} */ j) => j.v === 1 && typeof j.at === 'string',
+}
+/** @param {string} dir @param {string} name */
+function ownJsonFile(dir, name) {
+  if (!Object.hasOwn(OWN_JSON, name)) return false
+  const j = readJson(path.join(dir, name))
+  return !!j && typeof j === 'object' && OWN_JSON[/** @type {keyof typeof OWN_JSON} */ (name)](j)
+}
+
+/** SHA-256 of a file, read in pieces (a model is hundreds of MB). @param {string} file */
+function sha256Sync(file) {
+  const hash = crypto.createHash('sha256')
+  const buf = Buffer.alloc(1 << 20)
+  const fd = fs.openSync(file, 'r')
+  try {
+    for (;;) {
+      const n = fs.readSync(fd, buf, 0, buf.length, null)
+      if (!n) break
+      hash.update(buf.subarray(0, n))
+    }
+  } finally { fs.closeSync(fd) }
+  return hash.digest('hex')
+}
+
 /**
- * `uninstall --all --purge` (review 3, 6a): remove what this program created in the data folder and nothing else. In
- * our folder (marker) every entry we create goes, and the folder itself when nothing else is left; in a folder without
- * the marker only entries whose content proves they are ours, and the folder stays. Never call it for a protected
- * folder (`protectedFolder`): the caller refuses those.
+ * Remove from <dir> the entries `ours` accepts; then the folder itself when nothing else is in it. Throws when an
+ * entry could not be removed. @param {string} dir @param {(name: string, full: string, st: fs.Stats) => boolean} ours
+ */
+function removeOurs(dir, ours) {
+  let left = false
+  for (const name of fs.readdirSync(dir)) {
+    const full = path.join(dir, name)
+    let st
+    try { st = fs.lstatSync(full) } catch { continue }
+    if (ours(name, full, st)) fs.rmSync(full, { recursive: true, force: true })
+    else left = true
+  }
+  if (!left) { try { fs.rmdirSync(dir) } catch { /* in use */ } }
+}
+
+/** the files of our sub-folders, never the folders of somebody else's (review 4, A1) @param {string} h @param {string} n */
+function purgeFolder(h, n) {
+  const dir = path.join(h, n)
+  const isFile = (/** @type {fs.Stats} */ st) => st.isFile()
+  switch (n) {
+    case 'hooks': return removeOurs(dir, (name, _f, st) => isFile(st) && SCRIPTS.includes(name))
+    case 'openclaw': case 'hermes': return removeOurs(dir, (name, _f, st) => isFile(st) && (ownJsonFile(dir, name) || (Object.hasOwn(OWN_JSON, name.replace(/\.\d+\.tmp$/, '')) && /\.\d+\.tmp$/.test(name))))
+    case 'voice': {
+      const pk = readJson(path.join(dir, 'package.json'))
+      if (!pk || pk.name !== 'hinty-agents-voice') return
+      return removeOurs(dir, (name, _f, st) => (isFile(st) && (name === 'package.json' || name === 'package-lock.json')) || (name === 'node_modules' && (st.isDirectory() || st.isSymbolicLink())))
+    }
+    case 'models': return removeOurs(dir, (id, full, st) => {
+      if (!st.isDirectory() || !Object.hasOwn(MODELS, id)) return false
+      const files = new Map(MODELS[/** @type {keyof typeof MODELS} */ (id)].files.map((f) => [f.name, f]))
+      removeOurs(full, (name, p, s) => {
+        if (!s.isFile()) return false
+        const part = /^(.+)\.\d+\.part$/.exec(name)
+        if (part && files.has(part[1])) return true
+        const f = files.get(name)
+        return !!f && s.size === f.size && sha256Sync(p) === f.sha256
+      })
+      return !fs.existsSync(full)
+    })
+    case 'app': { try { fs.rmdirSync(dir) } catch { /* not empty: removeProgramCopies decides what goes */ } return }
+    default: fs.rmSync(dir, { recursive: true, force: true })
+  }
+}
+
+/**
+ * `uninstall --all --purge` (review 3, 6a; review 4, A1): remove what this program created in the data folder and
+ * nothing else. In a folder we created (v2 marker) only the entries on the marker's list, and of those only our own
+ * files (a `models` folder loses the registry files whose checksum matches and our partial downloads, a `hooks` folder
+ * our three scripts, ...); the folder itself goes when nothing else is left. In any other folder only entries whose
+ * content proves they are ours, and the folder stays. Never call it for a protected folder (`protectedFolder`): the
+ * caller refuses those.
  * @param {string} [h] @returns {{ removed: string[], failed: string[], left: string[], folderGone: boolean }}
  */
 export function purgeHome(h = homeDir()) {
   /** @type {string[]} */
   const removed = [], failed = []
   if (protectedFolder(h)) return { removed, failed, left: ['(protected folder)'], folderGone: false }
+  const marker = readMarker(h)
   const ours = !purgeBlocker(h)
+  const listed = marker && marker !== 'legacy' ? new Set(marker.entries) : null
   let names = []
   try { names = fs.readdirSync(h) } catch { return { removed, failed, left: [], folderGone: !fs.existsSync(h) } }
   for (const n of names) {
-    if (n === HOME_MARKER || !isOurEntry(n) || (!ours && !provablyOurs(h, n))) continue
-    try { fs.rmSync(path.join(h, n), { recursive: true, force: true }); removed.push(n) } catch { failed.push(n) }
+    if (n === HOME_MARKER || !isOurEntry(n)) continue
+    if (listed ? !(listed.has(n) || TMP_NAME.test(n)) : !provablyOurs(h, n)) continue
+    try {
+      if (fs.lstatSync(path.join(h, n)).isDirectory()) purgeFolder(h, n)
+      else fs.rmSync(path.join(h, n), { force: true })
+      if (!fs.existsSync(path.join(h, n))) removed.push(n)
+    } catch { failed.push(n) }
   }
   let left = []
   try { left = fs.readdirSync(h).filter((n) => n !== HOME_MARKER) } catch { /* gone */ }
@@ -293,6 +439,7 @@ export function writeJson(file, obj) {
   const tmp = `${file}.${process.pid}.tmp`
   fs.writeFileSync(tmp, JSON.stringify(obj, null, 2) + '\n', { mode: 0o600 })
   fs.renameSync(tmp, file)
+  noteCreated(file)
   if (process.platform !== 'win32') { try { fs.chmodSync(file, 0o600) } catch { /* best effort */ } }
 }
 

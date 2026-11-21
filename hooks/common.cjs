@@ -20,7 +20,9 @@ function isAbs(p) {
 // HINTY_AGENTS_HOME only as an absolute path; a relative one (it would point into the project) is ignored
 function home() {
   const own = process.env.HINTY_AGENTS_HOME
-  return own && isAbs(own) ? own : require('path').join(require('os').homedir(), '.hinty-agents')
+  // a part ending in a space, a tab or a dot is another folder for Windows tools than for Node: refused like a relative path
+  const odd = (p) => require('path').resolve(p).split(/[\\/]/).some((seg) => /[ \t.]$/.test(seg))
+  return own && isAbs(own) && !odd(own) ? own : require('path').join(require('os').homedir(), '.hinty-agents')
 }
 
 function readJson(file) {

@@ -21,7 +21,7 @@ import { Relay } from './relay.js'
 import { Service } from './service.js'
 import { voiceReady } from './stt/install.js'
 import { SherpaEngine } from './stt/sherpa.js'
-import { ensureHome, homeAccess, isPaired, paths, pidAlive, readConfig, readDaemonInfo, readJson, updateConfig, writeJson } from './store.js'
+import { ensureHome, homeAccess, noteCreated, isPaired, paths, pidAlive, readConfig, readDaemonInfo, readJson, updateConfig, writeJson } from './store.js'
 import { VERSION } from './version.js'
 
 /**
@@ -48,6 +48,7 @@ async function takeLock(log) {
   for (let i = 0; i < 2; i++) {
     try {
       fs.writeFileSync(lock, String(process.pid), { flag: 'wx', mode: 0o600 })
+      noteCreated(lock)
       return true
     } catch (e) {
       if (/** @type {any} */ (e).code !== 'EEXIST') throw e

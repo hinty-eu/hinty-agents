@@ -639,7 +639,7 @@ async function uninstallAll(flags) {
     else out(`The data folder ${home} is kept (no terminal to ask; --purge deletes it).`)
   }
   // the program copies first (only version folders with our package.json), the rest of the data folder last
-  const copies = removeProgramCopies()
+  const copies = protectedFolder(home) ? { removed: [], kept: [], failed: [] } : removeProgramCopies()
   if (copies.removed.length) out(`${c.ok('✓')} Removed the program copy: ${appBase()} (${copies.removed.join(', ')})`)
   if (copies.failed.length) { bad++; out(c.bad(`✗ Could not remove ${copies.failed.map((n) => `${appBase()}/${n}`).join(', ')} (a file is in use?). Delete it by hand.`)) }
   if (copies.kept.length) out(c.warn(`! Left in ${appBase()} (not made by hinty-agents): ${copies.kept.join(', ')}`))

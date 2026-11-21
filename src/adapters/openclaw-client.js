@@ -19,6 +19,7 @@ import crypto from 'node:crypto'
 import fs from 'node:fs'
 import path from 'node:path'
 import { VERSION } from '../version.js'
+import { noteCreated } from '../store.js'
 
 const SPKI_PREFIX = Buffer.from('302a300506032b6570032100', 'hex')
 /** @param {Buffer} buf */
@@ -73,6 +74,7 @@ export function saveIdentity(file, id) {
   const tmp = `${file}.${process.pid}.tmp`
   fs.writeFileSync(tmp, JSON.stringify(id, null, 2), { mode: 0o600 })
   fs.renameSync(tmp, file)
+  noteCreated(file)
 }
 
 /**

@@ -9,7 +9,7 @@ import path from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { pipeline } from 'node:stream/promises'
 import { Readable, Transform } from 'node:stream'
-import { ensureHome, readJson, writeJson } from '../store.js'
+import { ensureHome, noteCreated, readJson, writeJson } from '../store.js'
 import { npmLaunch, runSync } from '../exec.js'
 import { DEFAULT_MODEL, MODELS, SHERPA_VERSION, VAD_MODEL, modelDir, modelsDir, voiceConfigFile, voiceDir } from './models.js'
 
@@ -88,6 +88,7 @@ export async function downloadFile(f, dir, onProgress) {
     }
   } catch { /* not there */ }
   fs.mkdirSync(dir, { recursive: true })
+  noteCreated(dir)
   const tmp = `${dest}.${process.pid}.part`
   const res = await fetch(f.url, { redirect: 'follow' })
   if (!res.ok || !res.body) throw new Error(`download failed (${res.status}) ${f.name}`)
@@ -119,6 +120,7 @@ export const VOICE_LOCK = () => fileURLToPath(new URL('./voice-package-lock.json
 
 function installSherpa() {
   fs.mkdirSync(voiceDir(), { recursive: true })
+  noteCreated(voiceDir())
   // security review point 11 / review 2: the exact tree from our lock file (sherpa-onnx-node and its per-platform
   // packages, each with a sha512 `integrity` npm checks), installed with `npm ci --ignore-scripts`: no version is picked
   // at install time and no package script runs (sherpa-onnx-node 2.0.2 ships prebuilt binaries and needs none)
