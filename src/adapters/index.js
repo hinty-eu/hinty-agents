@@ -10,9 +10,11 @@
 import * as claude from './claude.js'
 import * as codex from './codex.js'
 import * as grok from './grok.js'
+import * as openclaw from './openclaw.js'
+import * as hermes from './hermes.js'
 
 /** @type {Record<string, any>} */
-export const ADAPTERS = { claude, codex, grok }
+export const ADAPTERS = { claude, codex, grok, openclaw, hermes }
 
 export const ids = () => Object.keys(ADAPTERS)
 
@@ -28,5 +30,7 @@ export function activeAgents() {
   const out = ['claude']
   try { if (codex.installed().installed) out.push('codex') } catch { /* unreadable hooks.json: not active */ }
   try { if (grok.installed().installed) out.push('grok') } catch { /* same */ }
+  try { if (openclaw.installed().installed) out.push('openclaw') } catch { /* same */ }
+  try { if (hermes.installed().installed) out.push('hermes') } catch { /* same */ }
   return out
 }

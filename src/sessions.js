@@ -1,11 +1,11 @@
 // @ts-check
 // Agent sessions known on this computer. Kept locally whatever the mode; only sent out while away mode is on (N5).
-import { baseLabel } from './text.js'
+import { baseLabel, oneLine } from './text.js'
 
 /**
  * @typedef {'run' | 'perm' | 'ask' | 'done' | 'idle' | 'err' | 'end'} SessState
  * @typedef {{ sid: string, agent: string, cwd: string, label: string, st: SessState, line: string, at: number,
- *   seenAt: number, modSeenAt: number, interactive: boolean | null, answer: string, home: string }} Session
+ *   seenAt: number, modSeenAt: number, interactive: boolean | null, answer: string, home: string, say?: boolean, labelFixed?: boolean }} Session
  */
 
 export const SID_RE = /^[\x21-\x7e]{1,64}$/
@@ -30,7 +30,7 @@ export class SessionTable {
 
   /**
    * Register or touch a session. Label: the folder's name, `-2`, `-3`... when another live session has it.
-   * @param {{ sid: string, cwd?: string, agent?: string, fromMod?: boolean, interactive?: boolean, home?: string }} p
+   * @param {{ sid: string, cwd?: string, agent?: string, fromMod?: boolean, interactive?: boolean, home?: string, label?: string }} p
    * @returns {{ s: Session, isNew: boolean }}
    */
   touch(p) {
@@ -40,7 +40,7 @@ export class SessionTable {
     if (!s) {
       const cwd = typeof p.cwd === 'string' ? p.cwd : ''
       s = {
-        sid: p.sid, agent: p.agent || 'claude', cwd, label: this.freeLabel(baseLabel(cwd)), st: 'idle', line: '',
+        sid: p.sid, agent: p.agent || 'claude', cwd, label: this.freeLabel(p.label ? oneLine(p.label, 50) || baseLabel(cwd) : baseLabel(cwd)), st: 'idle', line: '',
         at: now, seenAt: now, modSeenAt: 0, interactive: null, answer: '', home: '',
       }
       this.map.set(p.sid, s)
@@ -49,7 +49,8 @@ export class SessionTable {
     if (p.fromMod) s.modSeenAt = now
     if (typeof p.interactive === 'boolean') s.interactive = p.interactive
     if (p.home) s.home = p.home
-    if (!s.cwd && typeof p.cwd === 'string' && p.cwd) { s.cwd = p.cwd; s.label = this.freeLabel(baseLabel(p.cwd), s.sid) }
+    if (p.label && !s.labelFixed && isNew) s.labelFixed = true
+    if (!s.cwd && !s.labelFixed && typeof p.cwd === 'string' && p.cwd) { s.cwd = p.cwd; s.label = this.freeLabel(baseLabel(p.cwd), s.sid) }
     return { s, isNew }
   }
 

@@ -10,6 +10,7 @@
     "bin/",
     "src/",
     "claude-plugin/",
+    "hermes-plugin/",
     "hooks/",
     ".claude-plugin/",
     "README.md",

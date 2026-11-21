@@ -1,8 +1,7 @@
 # hinty-agents
 
 Approve or deny your AI coding agent's permission prompts, and follow what each session is doing, from Hinty
-smart-glasses or the Hinty web panel while you are away from the desk. Claude Code, Codex CLI and Grok Build today;
-OpenClaw and Hermes later.
+smart-glasses or the Hinty web panel while you are away from the desk. Claude Code, Codex CLI, Grok Build, OpenClaw and Hermes Agent.
 
 ```
 api       asks to run: npm run test:e2e        [Allow once] [Deny]
@@ -88,10 +87,11 @@ npx hinty-agents away off     # back at the desk
 | `npx hinty-agents` | set up (options: `--no-install`, `--no-start`, `--label <name>`) |
 | `status` | service, link, away mode, sessions |
 | `away on\|off` | away-from-desk mode |
-| `install <claude\|codex\|grok>` / `uninstall <...>` | add or remove an agent's integration (`install grok --ask-shell`: see Grok Build) |
+| `install <claude\|codex\|grok\|openclaw\|hermes>` / `uninstall <...>` | add or remove an agent's integration (`install grok --ask-shell`: see Grok Build; `install openclaw --token-file <file>`: see OpenClaw) |
 | `doctor` | checks Node, Claude Code, the plugin (`claude plugin validate`), the service, the link, the hook and whether the mod reports in |
 | `unpair` | disconnect this computer from your account and delete the token |
 | `voice install` / `status` / `remove` | local speech to text for dictation from the glasses (see Voice) |
+| `voice install|status|remove` | local speech to text for dictation from the glasses (see Voice) |
 | `start` / `stop` | start or stop the background service (`stop` also keeps it from starting with the next session) |
 
 After a reboot the SessionStart hook starts the service again (unless you ran `stop`).
@@ -154,11 +154,71 @@ crashes, times out or the service is down, Grok **runs the step**. So with `--as
 Without `--ask-shell` only the passive hooks are installed. Grok ignores the output of those, so there is no glasses line
 and **instructions from the glasses are not supported** for Grok sessions.
 
+## OpenClaw
+
+`npx hinty-agents install openclaw` pairs the bridge once with your **local** OpenClaw Gateway (the first connection from
+the loopback pairs itself; a remote Gateway needs `openclaw devices approve <requestId>`). It reads the Gateway port and
+token from your `openclaw.json` (or `OPENCLAW_GATEWAY_TOKEN`) for that one connection only and does not store the shared
+token; if the token is a secret reference (`file` / `exec`) give it once with `--token-file <file>`. **Nothing in your
+OpenClaw configuration is changed.** Works with OpenClaw 2026.3.x (protocol 3) and is written for 2026.11 (protocol 4,
+negotiated; not yet tried on a live 2026.11).
+
+- **Approvals.** Every exec (and plugin) approval request becomes a card on the glasses / panel; **Allow** sends
+  `allow-once`, **Deny** sends `deny`. `allow-always` is never sent. No answer sends nothing: OpenClaw then applies its own
+  `askFallback` (default: deny) or another window of yours answers. An answer from another window (Control UI, TUI,
+  `/approve`) closes the card at once.
+- **The bridge is an OpenClaw client only while away mode is on** (and the link to Hinty is up). The mere presence of an
+  approvals client changes OpenClaw's behaviour (a request waits until it times out instead of ending at once), so at the
+  desk the bridge is not connected at all.
+- **Sessions and messages.** Up to 8 recently active sessions show on the glasses (label = the agent, plus the channel for
+  non-web sessions, e.g. `publisher·telegram`), with the `👓` line of the last answer. A message from the glasses is sent
+  with `chat.send` as plain text (see "Instructions are plain text"; for OpenClaw `/` and `!` are also neutralised after
+  white space, because OpenClaw runs `/approve ... allow-always`, `/exec security=full` and `! cmd` from chat text).
+- **Token.** The device token is stored in `~/.hinty-agents/openclaw/` (owner only). It has the `operator.write` scope, so it
+  can message your sessions: it never goes to the Hinty server or to a log. Revoke it with `openclaw devices remove <id>`
+  (`uninstall openclaw` prints the command and deletes the local files).
+- **Warning: `askFallback: full`.** If your OpenClaw is set to `askFallback: full`, OpenClaw itself allows a step when
+  nobody answers in time, and the bridge cannot change that. `doctor` and `install` warn when they see it in
+  `exec-approvals.json`; set it to `deny` to keep "no answer = no".
+
+## Hermes Agent
+
+`npx hinty-agents install hermes` (needs Hermes 0.21.5 or newer) copies a small plugin (Python, standard library only,
+`hermes-plugin/hinty-agents`) into `<HERMES_HOME>/plugins/hinty-agents` and sets, with `hermes config set`:
+
+```
+security.approval.transport_fallback = builtin        (set first)
+security.approval.transport          = hinty
+plugins.entries.hinty-agents.allow_gateway_injection = true
+```
+
+and enables the plugin. It remembers what you had; **`uninstall hermes` puts the earlier values back** (or Hermes's
+defaults) and never leaves `transport: hinty` with `fallback: deny` behind. Restart the Hermes gateway / open sessions
+afterwards (plugins load once per process).
+
+- **Approvals.** While away mode is on, each approval prompt (CLI, TUI, Desktop, messengers) is shown on the glasses /
+  panel through Hermes's approval transport; Allow = `once`, Deny = `deny`. `session` and `always` are never returned.
+- **No answer = Hermes asks as usual (N1).** Away mode off, the bridge not running, no answer in time or any error makes
+  the plugin raise, and `transport_fallback: builtin` makes Hermes show its normal prompt. **Trade-off:** while away mode
+  is on, the terminal prompt appears only after that wait (about 7 seconds before Hermes's own approval timeout, 5 minutes
+  by default), so switch away mode off when you sit down. `doctor` checks that the fallback is `builtin`.
+- **Sessions and messages.** Session state and the last answer come from Hermes hooks; a message from the glasses reaches
+  the session through `ctx.inject_message` as a plain user message (a leading `/` or `!` is neutralised, and the plugin
+  refuses anything that still looks like a command). Messages need the plugin's polling thread, so they work while
+  Hermes runs. The plugin cannot always tell which of several simultaneous sessions asked: with exactly one running
+  session it is exact, otherwise the card is labelled by Hermes's session key.
+- **Needs Python 3.14 as Hermes's own interpreter** (Hermes builds an isolated 3.14 environment for plugins); the plugin itself
+  is plain standard-library Python.
+- Verified: install / uninstall with the real `hermes` CLI (settings restored), the real plugin loader registering the
+  `hinty` transport, a live Hermes session calling the transport and falling back to its normal prompt when the bridge says
+  no (away mode off), and the allow / deny / failure handling through Hermes's own `invoke_approval_transport`. Not verified
+  on a live session: an answer from the glasses in a running TUI, and `ctx.inject_message`.
+
 ## Instructions are plain text
 
 Whatever you send from the glasses or the panel reaches the agent as an ordinary message, never as a command: Claude Code
 treats a leading `!` as bash mode (no permission), `/` as a slash command and `#` as a memory note, and OpenClaw runs a
-chat line `/approve <id> allow-always` as an approval. The service puts a zero-width space in front of every line that,
+chat line `/approve <id> allow-always` as an approval (checked on a live OpenClaw). The service puts a zero-width space in front of every line that,
 after leading white space, starts with `/`, `!`, `#`, `@` or `$`. Other text is passed byte for byte.
 
 ## Voice (dictate to your agents from the glasses)
@@ -188,10 +248,49 @@ npx hinty-agents voice remove       # deletes the engine and every model
 - **Accuracy:** measured in `testy-e2e/agenci/stt/WYNIKI.md` of the Hinty repository. English commands are near perfect; Polish
   sentences with English jargon often need a fix in the preview step.
 
+## Voice (dictate to your agents from the glasses)
+
+Local speech to text, free, no cloud API. Say an instruction in the glasses' dictation view; the text comes back to the
+glasses, you choose Send / Edit / Add / Cancel, and only Send reaches the agent.
+
+\sherpa-onnx-node 2.0.2: already installed
+  silero_vad.onnx: already there
+  encoder.int8.onnx: already there
+  decoder.int8.onnx: already there
+  joiner.int8.onnx: already there
+  tokens.txt: already there
+trial load of the model ...
+voice is ready (model parakeet-v3)
+Voice (local speech to text)
+Ready:    yes (model parakeet-v3)
+Engine:   sherpa-onnx-node 2.0.2 (23 MB on disk)
+  parakeet-v3    installed  640 MB on disk
+  whisper-small  installed  358 MB on disk
+  whisper-turbo  installed  989 MB on disk
+  silero-vad     installed  0.6 MB on disk
+✓ Voice removed (2009 MB freed).
+- **Engine:**  2.0.2 (Apache 2.0), installed on demand into , never added to this
+  package's dependencies. Models go to , each file is checked against a pinned size and SHA-256
+  and written atomically. A running service says  again with  right after the install.
+- **Models:**  (default; NVIDIA Parakeet TDT 0.6b v3 int8, 25 European languages incl. Polish, CC BY 4.0, ~640 MB,
+  ~1 GB RAM while in use),  (358 MB) and  (989 MB, slow on CPU) via
+  . Silero VAD (0.6 MB) splits speech into stretches that are recognized while you are still talking.
+  The model loads when dictation starts and is released after 10 idle minutes.
+- **Developer words:** the default model is biased towards ~130 words like commit, rebase, README, endpoint, package.json
+  (). Add your own, one per line ( sets a score), in .
+   turns the bias off.
+- **Privacy:** audio exists only in memory while one utterance is recognized (at most 35 s, one at a time) and is dropped
+  afterwards; nothing is written to disk and logs hold counts only. Recognition runs on this computer. With away mode
+  off the bridge reads nothing: it only answers . Only the recognized text goes back to your own glasses screen.
+- **Accuracy:** measured in . English commands are near perfect; Polish sentences with English
+  jargon often need a fix in the preview step.
+
 ## Uninstall
 
 ```bash
 npx hinty-agents uninstall claude   # removes the plugin and the marketplace entry
+npx hinty-agents uninstall openclaw # deletes the device key and token (then: openclaw devices remove <id>)
+npx hinty-agents uninstall hermes   # restores your Hermes settings and removes the plugin
 npx hinty-agents unpair             # revokes this computer and deletes the token
 npx hinty-agents stop
 ```
@@ -207,7 +306,7 @@ claude plugin validate ./claude-plugin        # check the manifest, hooks and mo
 ```
 
 Use `HINTY_AGENTS_HOME` and `HINTY_AGENTS_API` to keep a test service away from your real one. Plain JavaScript with
-JSDoc types (no build step); the only dependency is `socket.io-client` (the speech engine and models are installed on demand by `voice install`). The mod's types come from Claude Code: once
+JSDoc types (no build step); the only dependency is `socket.io-client` (speech models and `sherpa-onnx-node` are installed on demand by `voice install`) (the speech engine and models are installed on demand by `voice install`). The mod's types come from Claude Code: once
 it has loaded the plugin, `claude-plugin/.claude-plugin/types/` holds them.
 
 Known limits:

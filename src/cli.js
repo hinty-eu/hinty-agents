@@ -13,6 +13,7 @@ import { MODELS } from './stt/models.js'
 import { fmtMB, installVoice, removeVoice, voiceStatus } from './stt/install.js'
 import { VERSION } from './version.js'
 
+const NAMES = /** @type {Record<string, string>} */ ({ codex: 'Codex CLI', grok: 'Grok Build', openclaw: 'OpenClaw', hermes: 'Hermes Agent' })
 const sleep = (/** @type {number} */ ms) => new Promise((r) => setTimeout(r, ms))
 const out = (/** @type {string} */ s = '') => process.stdout.write(s + '\n')
 const color = process.stdout.isTTY && !process.env.NO_COLOR
@@ -34,7 +35,9 @@ Usage: npx hinty-agents [command]
   install <agent>     claude: the plugin (hooks + mod) via Claude Code's plugin commands
                       codex: hooks merged into $CODEX_HOME/hooks.json (then trust them once: /hooks in Codex)
                       grok: ~/.grok/hooks/hinty.json; add --ask-shell to get a card for every shell command
-  uninstall <agent>   remove what install added (claude | codex | grok)
+                      openclaw: pairs once with your local Gateway (--token-file <file> if the token is a secret reference)
+                      hermes: plugin into Hermes's plugins folder + 3 Hermes settings (undone by uninstall)
+  uninstall <agent>   remove what install added (claude | codex | grok | openclaw | hermes)
   doctor              check Node, Claude Code, the plugin, the service and the link
   unpair              disconnect this computer from your Hinty account
   start | stop        start or stop the background service
@@ -195,11 +198,11 @@ async function setup(args) {
     else await installCmd('claude')
   }
 
-  for (const other of ['codex', 'grok']) {
+  for (const other of ['codex', 'grok', 'openclaw', 'hermes']) {
     const a = getAdapter(other)
     const f = a && a.detect()
     if (f && f.found && !a.installed().installed) {
-      out(`${c.ok('✓')} ${other === 'codex' ? 'Codex CLI' : 'Grok Build'} ${f.version || ''} found. To follow it too: npx hinty-agents install ${other}`)
+      out(`${c.ok('✓')} ${NAMES[other]} ${f.version || ''} found. To follow it too: npx hinty-agents install ${other}`)
     }
   }
 
@@ -329,20 +332,23 @@ async function installCmd(agent, flags = []) {
     }
     return r.ok ? 0 : 1
   }
+  const name = NAMES[/** @type {string} */ (agent)]
   const found = a.detect()
-  if (!found.found) out(c.warn(`! ${agent === 'codex' ? 'Codex CLI (`codex`)' : 'Grok Build (`grok`)'} was not found on PATH; installing the hooks anyway (they are only files).`))
-  else out(`${c.ok('✓')} ${agent === 'codex' ? 'Codex CLI' : 'Grok Build'} ${found.version || ''}`)
+  const hooksOnly = agent === 'codex' || agent === 'grok'
+  if (!found.found) out(c.warn(`! ${name} was not found on PATH${hooksOnly ? '; installing the hooks anyway (they are only files)' : ''}.`))
+  else out(`${c.ok('✓')} ${name} ${found.version || ''}`)
   const askShell = agent === 'grok' && flags.includes('--ask-shell')
   if (agent === 'grok' && askShell) {
     out(c.warn('! --ask-shell: Grok FAILS OPEN. If the Hinty hook crashes, times out or the service is down, Grok RUNS the step.'))
     out(c.warn("  \"Allow\" on the glasses only means \"no veto\": Grok's own permission prompts still apply."))
   }
-  const r = a.install({ askShell })
+  const flagValue = (/** @type {string} */ f) => { const i = flags.indexOf(f); return i >= 0 ? flags[i + 1] : undefined }
+  const r = await a.install({ askShell, tokenFile: flagValue('--token-file'), url: flagValue('--url') })
   for (const s of r.steps) out(`  ${s.ok ? c.ok('✓') : c.bad('✗')} ${s.step}: ${s.message}`)
   if (r.ok) {
     updateConfig({ entry: cliEntry() })
     await tellAgents()
-    out(`${c.ok('✓')} ${agent === 'codex' ? 'Codex' : 'Grok'} hooks installed. New sessions pick them up.`)
+    out(`${c.ok('✓')} ${name} ${hooksOnly ? 'hooks installed. New sessions pick them up.' : 'connected to the bridge.'}`)
   }
   return r.ok ? 0 : 1
 }
@@ -351,7 +357,7 @@ async function installCmd(agent, flags = []) {
 async function uninstallCmd(agent) {
   const a = getAdapter(agent)
   if (!a) { out(`Usage: npx hinty-agents uninstall <${Object.keys(ADAPTERS).join('|')}>`); return 1 }
-  const r = a.uninstall()
+  const r = await a.uninstall()
   for (const s of r.steps) out(`  ${s.ok ? c.ok('✓') : c.bad('✗')} ${s.step}: ${s.message}`)
   if (r.ok && agent !== 'claude') await tellAgents()
   return r.ok ? 0 : 1
@@ -405,7 +411,7 @@ async function doctor() {
 
   for (const other of ['codex', 'grok']) {
     const a = getAdapter(other)
-    const name = other === 'codex' ? 'Codex CLI' : 'Grok Build'
+    const name = NAMES[other]
     const f = a.detect()
     const inst = a.installed()
     if (!f.found && !inst.installed) continue
@@ -417,6 +423,13 @@ async function doctor() {
     } else {
       line(inst.installed ? true : null, inst.installed ? `Grok hooks in ${inst.file}${inst.askShell ? ' (ask-shell ON: Grok fails open)' : ''}` : 'Grok hooks not installed', inst.installed ? undefined : 'npx hinty-agents install grok')
     }
+  }
+  for (const other of ['openclaw', 'hermes']) {
+    const a = getAdapter(other)
+    const f = a.detect()
+    if (!f.found && !a.installed().installed) continue
+    line(null, f.found ? `${NAMES[other]} ${f.version || ''}` : `${NAMES[other]} not found on PATH`)
+    for (const l of await a.doctor()) line(l.ok, l.text, l.hint)
   }
 
   const s = await daemonStatus()

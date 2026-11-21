@@ -67,6 +67,12 @@ export class Service {
     /** consecutive instructions given to a session through its held Stop hook */
     /** @type {Map<string, number>} */
     this.continuations = new Map()
+    /** E5: agents with their own socket or plugin (OpenClaw, Hermes): `say` goes to their runtime, not to a queue
+     * @type {Map<string, { say?: (sid: string, text: string) => Promise<boolean> }>} */
+    this.runtime = new Map()
+    /** @type {Array<(live: boolean) => void>} */
+    this.liveListeners = []
+    this.lastLive = false
     // E3: spoken instructions. Without a voice engine every utterance is answered `no_stt`.
     this.voice = new Utterances({
       engine: o.voice ? o.voice.engine : { createVad() { throw new Error('no_stt') }, recognize: () => Promise.reject(new Error('no_stt')), load: () => Promise.reject(new Error('no_stt')) },
@@ -118,7 +124,8 @@ export class Service {
 
   /** @param {import('./sessions.js').Session} s */
   sessPayload(s) {
-    return { id: s.sid, agent: s.agent, label: s.label, st: s.st, line: s.line, at: s.at }
+    // `sess` is a full description of the session: a session that takes no commands says `say:false` in EVERY event
+    return { id: s.sid, agent: s.agent, label: s.label, st: s.st, line: s.line, at: s.at, ...(s.say === false || s.agent === 'grok' ? { say: false } : {}) }
   }
 
   /** @param {string} sid */
@@ -182,16 +189,17 @@ export class Service {
   /**
    * The part of a permission request every agent shares: a card, a wait, one of {} / {d}. The caller has checked
    * paired / link / away mode and the shape of `n` (N1).
-   * @param {{ sid: string, cwd: string, tool: string, input: unknown, agentId: string | null, agentType: string, home?: string }} n
-   * @param {Ctl} ctl @param {{ agent: string, ttlMs: number }} o
+   * @param {{ sid: string, cwd: string, tool: string, input: unknown, agentId: string | null, agentType: string, home?: string, cardText?: string, label?: string }} n
+   * @param {Ctl} ctl @param {{ agent: string, ttlMs: number, onCreate?: (p: import('./perms.js').Perm) => void }} o
    * @returns {Promise<HookAnswer>}
    */
   async requestPerm(n, ctl, o) {
     const { sid, tool, agentId, agentType } = n
-    this.sessions.touch({ sid, cwd: n.cwd, agent: o.agent, home: n.home })
+    this.sessions.touch({ sid, cwd: n.cwd, agent: o.agent, home: n.home, label: n.label })
     const perm = /** @type {import('./perms.js').Perm & { shownTool?: string }} */ (this.perms.create({
-      sid, agentId, tool, input: n.input, text: permText(tool, n.input), ttlMs: o.ttlMs,
+      sid, agentId, tool, input: n.input, text: n.cardText !== undefined ? (relayText(n.cardText).trim() || `(${oneLine(tool, 40)})`) : permText(tool, n.input), ttlMs: o.ttlMs,
     }))
+    o.onCreate?.(perm)
     perm.shownTool = oneLine(agentType ? `${tool} › ${agentType}` : tool, 80)
     const answer = new Promise((resolve) => {
       const timer = setTimeout(() => this.endPerm(perm.rid, 'timeout'), o.ttlMs)
@@ -548,12 +556,14 @@ export class Service {
         this.relayInfo.lastError = null
         this.hello()
         this.sendAll()
+        this.notifyLive()
         return
       case 'disconnect':
         // N1: link lost = the relay forgets our requests; the hooks end empty at once
         this.releaseAll('link_lost')
         this.voice.dropActive()
         this.wake()
+        this.notifyLive()
         return
       case 'audio_start': this.voice.onStart(payload); return
       case 'audio': this.voice.onAudio(payload); return
@@ -583,11 +593,17 @@ export class Service {
           this.log('say_refused', { reason: this.away.on ? 'no_session' : 'away_off' })
           return
         }
-        if (this.sessions.get(sid)?.agent === 'grok') {
+        const sess = this.sessions.get(sid)
+        if (sess && (sess.agent === 'grok' || sess.say === false)) {
           this.log('say_refused', { reason: 'unsupported' })
           return
         }
-        const sess = this.sessions.get(sid)
+        const rt = sess && this.runtime.get(sess.agent)
+        if (rt && rt.say) {
+          this.log('say_in', { via: sess.agent })
+          rt.say(sid, text).then((ok) => this.log('say_done', { via: sess.agent, ok }), () => this.log('say_done', { via: sess.agent, ok: false }))
+          return
+        }
         if (sess && sess.agent === 'codex' && this.codexQueue && !this.codexQueueBroken) {
           // Codex 0.171+: `codex queue` puts it in the session as the person's next message
           this.log('say_in', { via: 'queue' })
@@ -620,11 +636,13 @@ export class Service {
         this.paired = false
         this.releaseAll('unpaired')
         this.onUnpaired('revoked')
+        this.notifyLive()
         return
       case 'invalid_token':
         this.paired = false
         this.releaseAll('unpaired')
         this.onUnpaired('invalid_token')
+        this.notifyLive()
         return
       case 'denied':
       case 'connect_error':
@@ -661,6 +679,44 @@ export class Service {
       this.send('away', { on: false })
     }
     this.wake()
+    this.notifyLive()
+  }
+
+  // ------------------------------------------------------------------------------------------------
+  // Agents with their own socket or plugin (E5: OpenClaw, Hermes)
+  // ------------------------------------------------------------------------------------------------
+
+  notifyLiveOff() { this.lastLive = false; for (const fn of this.liveListeners) { try { fn(false) } catch { /* ignore */ } } }
+
+  /** @param {string} agent @param {{ say?: (sid: string, text: string) => Promise<boolean> }} impl */
+  attachAgent(agent, impl) { this.runtime.set(agent, impl) }
+
+  /** Called with true when hooks may wait for a person (paired, link up, away mode on), false otherwise; on changes only. @param {(live: boolean) => void} fn */
+  onLive(fn) { this.liveListeners.push(fn) }
+
+  notifyLive() {
+    const live = this.hooksLive()
+    if (live === this.lastLive) return
+    this.lastLive = live
+    for (const fn of this.liveListeners) { try { fn(live) } catch (e) { this.log('live_listener_error', { err: /** @type {Error} */ (e)?.name }) } }
+  }
+
+  /**
+   * Report a session of such an agent: registers it (label given by the agent), sets state, status line and the last
+   * answer. While a permission card of the session is open its state stays `perm`.
+   * @param {string} agent
+   * @param {{ sid: string, cwd?: string, label?: string, st?: import('./sessions.js').SessState, line?: string, answer?: string, say?: boolean }} p
+   */
+  agentSession(agent, p) {
+    if (typeof p.sid !== 'string' || !SID_RE.test(p.sid) || this.isEnded(p.sid)) return false
+    const { s, isNew } = this.sessions.touch({ sid: p.sid, cwd: p.cwd || '', agent, label: p.label })
+    let changed = isNew
+    if (typeof p.say === 'boolean' && (s.say === false) !== (p.say === false)) { s.say = p.say; changed = true }
+    if (typeof p.answer === 'string' && this.away.isOn()) s.answer = relayText(p.answer)
+    const st = this.perms.list((x) => x.sid === p.sid).length ? undefined : p.st
+    if (this.sessions.set(p.sid, { st, line: p.line })) changed = true
+    if (changed) this.queueSess(p.sid)
+    return true
   }
 
   // ------------------------------------------------------------------------------------------------
@@ -708,6 +764,7 @@ export class Service {
   }
 
   stop() {
+    if (this.lastLive) this.notifyLiveOff()
     this.voice.dropActive()
     this.releaseAll('stopping')
     this.wake()

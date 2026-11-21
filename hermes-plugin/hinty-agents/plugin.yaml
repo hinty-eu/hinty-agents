@@ -1,0 +1,13 @@
+name: hinty-agents
+version: 0.2.0
+description: "Answer Hermes approval prompts from Hinty smart glasses and the Hinty panel, follow sessions, send follow-up messages. Talks only to the Hinty Agents bridge on 127.0.0.1; a missing bridge or away mode off means the normal Hermes prompt."
+author: "Hinty"
+provides_hooks:
+  - pre_approval_request
+  - post_approval_response
+  - pre_llm_call
+  - post_llm_call
+  - on_session_end
+  - on_session_finalize
+  - on_human_input_request
+  - on_human_input_resolved

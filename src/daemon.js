@@ -6,6 +6,8 @@ import { newSecret } from './crypto.js'
 import { activeAgents } from './adapters/index.js'
 import * as codex from './adapters/codex.js'
 import * as grok from './adapters/grok.js'
+import { OpenClawLink } from './adapters/openclaw.js'
+import { HermesLink } from './adapters/hermes.js'
 import { createLocalServer, listenLoopback } from './local-http.js'
 import { createLog } from './log.js'
 import { Relay } from './relay.js'
@@ -64,6 +66,14 @@ export async function runDaemon() {
     },
   })
   relay.on('relay', (ev, payload) => service.onRelay(ev, payload))
+  // E5: OpenClaw (own WebSocket to its Gateway, only while live) and Hermes (its plugin calls our local port)
+  const openclaw = new OpenClawLink({ service, log })
+  service.attachAgent('openclaw', { say: (sid, text) => openclaw.say(sid, text) })
+  const hermes = new HermesLink({ service, log })
+  service.onLive((live) => {
+    if (live) openclaw.start()
+    else { openclaw.stop(); hermes.clear() }
+  })
   // instructions for Codex sessions go through `codex queue` when this Codex has it (HINTY_AGENTS_CODEX_SAY=hold forces the
   // Stop-hook fallback, for tests); the probe runs in the background and never delays start
   if (process.env.HINTY_AGENTS_CODEX_SAY !== 'hold') {
@@ -92,6 +102,11 @@ export async function runDaemon() {
       'POST /v1/hook/grok/session-start': (body) => service.agentSessionStart('grok', body),
       'POST /v1/hook/grok/prompt': (body) => service.agentActivity('grok', body),
       'POST /v1/hook/grok/session-end': (body) => service.agentSessionEnd('grok', body),
+      // Hermes Agent plugin (E5)
+      'POST /v1/hermes/perm': (body, ctl) => hermes.perm(body, ctl),
+      'POST /v1/hermes/event': (body) => hermes.event(body),
+      'POST /v1/hermes/poll': (body, ctl) => hermes.poll(body, ctl),
+      'POST /v1/hermes/ack': (body) => hermes.ack(body),
       // after `install` / `uninstall` of an agent: say `hello` again with the new list
       'POST /v1/agents/reload': () => service.agentsChanged(),
       'POST /v1/mod/poll': (body, ctl) => service.modPoll(body, ctl),
@@ -123,6 +138,7 @@ export async function runDaemon() {
     log('stop', { code })
     clearInterval(ticker)
     service.stop()
+    openclaw.stop()
     engine.release()
     relay.stop()
     server.close()
