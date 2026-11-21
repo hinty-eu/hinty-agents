@@ -3,6 +3,9 @@
 // Started by `hinty-agents start` (or the wizard, or the SessionStart hook after a reboot); stopped by `hinty-agents stop`.
 import fs from 'node:fs'
 import { newSecret } from './crypto.js'
+import { activeAgents } from './adapters/index.js'
+import * as codex from './adapters/codex.js'
+import * as grok from './adapters/grok.js'
 import { createLocalServer, listenLoopback } from './local-http.js'
 import { createLog } from './log.js'
 import { Relay } from './relay.js'
@@ -51,6 +54,7 @@ export async function runDaemon() {
   const engine = new SherpaEngine({ log })
   const service = new Service({
     voice: { engine, ready: voiceReady },
+    agents: () => ({ agents: activeAgents(), grok: { askShell: grok.askShellOn(), except: grok.exceptions() } }),
     relay: { get connected() { return relay.connected }, emit: (ev, payload) => relay.send(ev, payload) },
     log,
     onUnpaired: (why) => {
@@ -60,6 +64,13 @@ export async function runDaemon() {
     },
   })
   relay.on('relay', (ev, payload) => service.onRelay(ev, payload))
+  // instructions for Codex sessions go through `codex queue` when this Codex has it (HINTY_AGENTS_CODEX_SAY=hold forces the
+  // Stop-hook fallback, for tests); the probe runs in the background and never delays start
+  if (process.env.HINTY_AGENTS_CODEX_SAY !== 'hold') {
+    setImmediate(() => {
+      try { if (codex.queueSupported()) { service.codexQueue = codex.queueMessage; log('codex_queue', { ok: true }) } else log('codex_queue', { ok: false }) } catch { log('codex_queue', { ok: false }) }
+    })
+  }
 
   const server = createLocalServer({
     secret,
@@ -69,6 +80,20 @@ export async function runDaemon() {
       'GET /v1/status': () => ({ ...service.status(), version: VERSION, api: config.api, label: config.label || null, bridgeId: config.bridgeId || null }),
       'POST /v1/hook/permission': (body, ctl) => service.hookPermission(body, ctl),
       'POST /v1/hook/session-start': (body) => service.hookSessionStart(body),
+      // Codex CLI and Grok Build hooks (E4)
+      'POST /v1/hook/codex/permission': (body, ctl) => service.codexPermission(body, ctl),
+      'POST /v1/hook/codex/stop': (body, ctl) => service.codexStop(body, ctl),
+      'POST /v1/hook/codex/session-start': (body) => service.agentSessionStart('codex', body),
+      'POST /v1/hook/codex/prompt': (body) => service.agentActivity('codex', body),
+      'POST /v1/hook/codex/tool': (body) => service.agentActivity('codex', body),
+      'POST /v1/hook/codex/session-end': (body) => service.agentSessionEnd('codex', body),
+      'POST /v1/hook/grok/pre-tool': (body, ctl) => service.grokPreTool(body, ctl),
+      'POST /v1/hook/grok/stop': (body) => service.agentStop('grok', body),
+      'POST /v1/hook/grok/session-start': (body) => service.agentSessionStart('grok', body),
+      'POST /v1/hook/grok/prompt': (body) => service.agentActivity('grok', body),
+      'POST /v1/hook/grok/session-end': (body) => service.agentSessionEnd('grok', body),
+      // after `install` / `uninstall` of an agent: say `hello` again with the new list
+      'POST /v1/agents/reload': () => service.agentsChanged(),
       'POST /v1/mod/poll': (body, ctl) => service.modPoll(body, ctl),
       'POST /v1/mod/event': (body) => service.modEvent(body),
       'POST /v1/mod/ack': (body) => service.modAck(body),

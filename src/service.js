@@ -6,13 +6,21 @@ import os from 'node:os'
 import { AwayMode } from './away.js'
 import { PermTable } from './perms.js'
 import { SessionTable, SID_RE } from './sessions.js'
-import { glassesLine, oneLine, permText, relayText } from './text.js'
+import * as codex from './adapters/codex.js'
+import * as grok from './adapters/grok.js'
+import { glassesLine, oneLine, permText, relayText, safeInstruction } from './text.js'
 import { Utterances } from './stt/utterance.js'
 
 export const PROTOCOL_V = 1
 /** Hook `timeout` in hooks.json is 900 s; the request (and the relay's card) expires earlier so the hook can end cleanly. */
 export const PERM_TTL_MS = 840 * 1000
 export const POLL_HOLD_MS = 20 * 1000
+/** Codex: permission card and held Stop hook stay inside the hooks' 600 s (hooks.json); Grok: the card's own wait. */
+export const CODEX_PERM_TTL_MS = 570 * 1000
+export const CODEX_STOP_HOLD_MS = 540 * 1000
+export const GROK_PERM_TTL_MS = 280 * 1000
+/** instructions handed to one session in a row (held Stop hook); same limit as the Claude Code plan §4.2 */
+export const MAX_CONTINUATIONS = 8
 const SESS_REFRESH_MS = 10 * 60 * 1000
 /** after session.end, ignore that session's late polls and events for this long */
 const ENDED_MS = 15 * 1000
@@ -31,7 +39,10 @@ export class Service {
    *   paired?: boolean, log?: (m: string, f?: Record<string, any>) => void, now?: () => number,
    *   permTtlMs?: number, pollHoldMs?: number, sessDebounceMs?: number, host?: string,
    *   onUnpaired?: (why: string) => void, awayMaxMs?: number,
-   *   voice?: { engine: import('./stt/utterance.js').Engine, ready: () => boolean } }} o
+   *   voice?: { engine: import('./stt/utterance.js').Engine, ready: () => boolean },
+   *   agents?: () => { agents: string[], grok?: { askShell: boolean, except: string[] } },
+   *   codexQueue?: ((sid: string, text: string, home?: string) => Promise<boolean>) | null,
+   *   codexPermTtlMs?: number, codexStopHoldMs?: number, grokPermTtlMs?: number }} o
    */
   constructor(o) {
     this.relay = o.relay
@@ -45,6 +56,17 @@ export class Service {
     this.onUnpaired = o.onUnpaired || (() => {})
     this.away = new AwayMode({ now: this.now, maxMs: o.awayMaxMs, onChange: (on, why) => this.onAwayChange(on, why) })
     this.voiceReady = o.voice ? o.voice.ready : () => false
+    // E4: which agents are installed (for `hello`) and the Grok ask-shell option; read again on `agentsChanged()`
+    this.agentsInfo = o.agents || (() => ({ agents: ['claude'] }))
+    /** `codex queue` (set by the daemon once it knows this Codex has it); null = instructions go through a held Stop hook */
+    this.codexQueue = o.codexQueue ?? null
+    this.codexQueueBroken = false
+    this.codexPermTtlMs = o.codexPermTtlMs ?? CODEX_PERM_TTL_MS
+    this.codexStopHoldMs = o.codexStopHoldMs ?? CODEX_STOP_HOLD_MS
+    this.grokPermTtlMs = o.grokPermTtlMs ?? GROK_PERM_TTL_MS
+    /** consecutive instructions given to a session through its held Stop hook */
+    /** @type {Map<string, number>} */
+    this.continuations = new Map()
     // E3: spoken instructions. Without a voice engine every utterance is answered `no_stt`.
     this.voice = new Utterances({
       engine: o.voice ? o.voice.engine : { createVad() { throw new Error('no_stt') }, recognize: () => Promise.reject(new Error('no_stt')), load: () => Promise.reject(new Error('no_stt')) },
@@ -91,7 +113,7 @@ export class Service {
   }
 
   hello() {
-    this.send('hello', { v: PROTOCOL_V, host: this.host, agents: ['claude'], away: this.away.isOn(), ...(this.voiceReady() ? { stt: true } : {}) })
+    this.send('hello', { v: PROTOCOL_V, host: this.host, agents: this.agentsInfo().agents, away: this.away.isOn(), ...(this.voiceReady() ? { stt: true } : {}) })
   }
 
   /** @param {import('./sessions.js').Session} s */
@@ -154,13 +176,25 @@ export class Service {
     const tool = typeof input.tool_name === 'string' && input.tool_name ? input.tool_name : 'tool'
     const agentId = typeof input.agent_id === 'string' && input.agent_id ? input.agent_id : null
     const agentType = typeof input.agent_type === 'string' ? input.agent_type : ''
-    this.sessions.touch({ sid, cwd: typeof input.cwd === 'string' ? input.cwd : '' })
+    return this.requestPerm({ sid, cwd: typeof input.cwd === 'string' ? input.cwd : '', tool, input: input.tool_input, agentId, agentType }, ctl, { agent: 'claude', ttlMs: this.permTtlMs })
+  }
+
+  /**
+   * The part of a permission request every agent shares: a card, a wait, one of {} / {d}. The caller has checked
+   * paired / link / away mode and the shape of `n` (N1).
+   * @param {{ sid: string, cwd: string, tool: string, input: unknown, agentId: string | null, agentType: string, home?: string }} n
+   * @param {Ctl} ctl @param {{ agent: string, ttlMs: number }} o
+   * @returns {Promise<HookAnswer>}
+   */
+  async requestPerm(n, ctl, o) {
+    const { sid, tool, agentId, agentType } = n
+    this.sessions.touch({ sid, cwd: n.cwd, agent: o.agent, home: n.home })
     const perm = /** @type {import('./perms.js').Perm & { shownTool?: string }} */ (this.perms.create({
-      sid, agentId, tool, input: input.tool_input, text: permText(tool, input.tool_input), ttlMs: this.permTtlMs,
+      sid, agentId, tool, input: n.input, text: permText(tool, n.input), ttlMs: o.ttlMs,
     }))
     perm.shownTool = oneLine(agentType ? `${tool} › ${agentType}` : tool, 80)
     const answer = new Promise((resolve) => {
-      const timer = setTimeout(() => this.endPerm(perm.rid, 'timeout'), this.permTtlMs)
+      const timer = setTimeout(() => this.endPerm(perm.rid, 'timeout'), o.ttlMs)
       this.waiters.set(perm.rid, { resolve, timer })
     })
     ctl.onAbort?.(() => this.endPerm(perm.rid, 'cancel'))
@@ -169,7 +203,7 @@ export class Service {
     this.dirty.delete(sid)
     const s = this.sessions.get(sid)
     if (s) this.send('sess', this.sessPayload(s))
-    this.send('perm', this.permPayload(perm, Math.floor(this.permTtlMs / 1000)))
+    this.send('perm', this.permPayload(perm, Math.floor(o.ttlMs / 1000)))
     this.log('perm_in', { rid: perm.rid, t: perm.createdAt })
     return /** @type {Promise<HookAnswer>} */ (answer)
   }
@@ -228,6 +262,158 @@ export class Service {
   }
 
   // ------------------------------------------------------------------------------------------------
+  // Codex CLI and Grok Build hooks (E4). The agents' field names live in adapters/*.normalize.
+  // ------------------------------------------------------------------------------------------------
+
+  /** Paired, link up and away mode on: the only state in which a hook may wait for a person (N1, N5). */
+  hooksLive() { return this.paired && this.relay.connected && this.away.isOn() }
+
+  /** @param {string} agent @param {unknown} input */
+  agentInput(agent, input) {
+    const n = (agent === 'codex' ? codex : grok).normalize(input)
+    return n && SID_RE.test(n.sid) ? n : null
+  }
+
+  /** Codex PermissionRequest: allow / deny / {} (the terminal asks). @param {unknown} input @param {Ctl} [ctl] */
+  async codexPermission(input, ctl = {}) {
+    if (!this.hooksLive()) return {}
+    const n = this.agentInput('codex', input)
+    if (!n) return {}
+    return this.requestPerm(n, ctl, { agent: 'codex', ttlMs: this.codexPermTtlMs })
+  }
+
+  /**
+   * Grok PreToolUse (only with `install grok --ask-shell`). `{d:'deny'}` is a veto; anything else lets Grok go on
+   * (Grok fails open and its own checks still apply). Harmless commands (the exception list) never get a card.
+   * @param {unknown} input @param {Ctl} [ctl]
+   */
+  async grokPreTool(input, ctl = {}) {
+    if (!this.hooksLive()) return {}
+    const info = this.agentsInfo().grok
+    if (!info || !info.askShell) return {}
+    const n = this.agentInput('grok', input)
+    if (!n || !grok.isShellTool(n.tool)) return {}
+    const command = isObj(n.input) && typeof n.input.command === 'string' ? n.input.command : ''
+    if (!command || grok.isExcepted(command, info.except)) return {}
+    return this.requestPerm({ ...n, tool: 'Bash' }, ctl, { agent: 'grok', ttlMs: this.grokPermTtlMs })
+  }
+
+  /**
+   * SessionStart of Codex / Grok: register the session (label from the folder).
+   * @param {string} agent @param {unknown} input
+   */
+  agentSessionStart(agent, input) {
+    const n = this.agentInput(agent, input)
+    if (!n) return { ok: false }
+    this.ended.delete(n.sid)
+    const { s, isNew } = this.sessions.touch({ sid: n.sid, cwd: n.cwd, agent, home: n.home })
+    if (n.source === 'clear' || n.source === 'startup' || isNew) {
+      if (this.sessions.set(n.sid, { st: 'idle' }) || isNew) this.queueSess(n.sid)
+    }
+    return { ok: true, label: s.label }
+  }
+
+  /**
+   * A turn starts (UserPromptSubmit) or a tool finished (PostToolUse): the session runs; a prompt still waiting in the
+   * terminal must have been answered there (E0), so its card is closed and its hook ends empty.
+   * @param {string} agent @param {unknown} input
+   */
+  agentActivity(agent, input) {
+    const n = this.agentInput(agent, input)
+    if (!n) return { ok: false }
+    if (this.isEnded(n.sid)) return { ok: true }
+    const { isNew } = this.sessions.touch({ sid: n.sid, cwd: n.cwd, agent, home: n.home })
+    if (isNew) this.queueSess(n.sid)
+    const at = this.now()
+    for (const p of this.perms.list((x) => x.sid === n.sid && at > x.createdAt)) this.endPerm(p.rid, 'local')
+    if (this.away.isOn() && !this.perms.list((p) => p.sid === n.sid).length) {
+      if (this.sessions.set(n.sid, { st: 'run' })) this.queueSess(n.sid)
+    }
+    return { ok: true }
+  }
+
+  /**
+   * End of a turn (Stop): state `done` with the glasses line. Returns the normalized input, or null when ignored.
+   * @param {string} agent @param {unknown} input
+   */
+  agentStopState(agent, input) {
+    const n = this.agentInput(agent, input)
+    if (!n) return null
+    if (this.isEnded(n.sid)) return null
+    const { isNew } = this.sessions.touch({ sid: n.sid, cwd: n.cwd, agent, home: n.home })
+    if (isNew) this.queueSess(n.sid)
+    // a turn that ends closes whatever it still had open in the terminal (E0)
+    for (const p of this.perms.list((x) => x.sid === n.sid)) this.endPerm(p.rid, 'local')
+    if (this.away.isOn()) {
+      const s = this.sessions.get(n.sid)
+      if (s) s.answer = relayText(n.text)
+      if (this.sessions.set(n.sid, { st: 'done', line: n.text ? glassesLine(n.text) : '' })) this.queueSess(n.sid)
+    }
+    return n
+  }
+
+  /** Grok Stop (Grok ignores the answer). @param {string} agent @param {unknown} input */
+  agentStop(agent, input) {
+    this.agentStopState(agent, input)
+    return {}
+  }
+
+  /**
+   * Codex Stop: report the end of the turn, then (away mode on) hold the hook for a follow-up instruction from the
+   * glasses and answer `{cmd}` (the hook prints {"decision":"block","reason":cmd}: Codex continues with it as a new
+   * prompt). Nothing arrives in time, away mode turns off, the link drops: `{}` and the turn simply ends (N1).
+   * @param {unknown} input @param {Ctl} [ctl]
+   * @returns {Promise<{ cmd?: string }>}
+   */
+  async codexStop(input, ctl = {}) {
+    const n = this.agentStopState('codex', input)
+    if (!n || !this.hooksLive()) return {}
+    if (this.codexQueue && !this.codexQueueBroken) return {} // instructions arrive through `codex queue`; the turn just ends
+    const sid = n.sid
+    if (!n.stopActive) this.continuations.set(sid, 0)
+    if ((this.continuations.get(sid) || 0) >= MAX_CONTINUATIONS) { this.log('say_refused', { reason: 'limit' }); return {} }
+    if (!(this.cmds.get(sid) || []).length) {
+      await new Promise((resolve) => {
+        const set = this.pollers.get(sid) || new Set()
+        const done = () => { clearTimeout(timer); set.delete(done); if (!set.size) this.pollers.delete(sid); resolve(undefined) }
+        const timer = setTimeout(done, this.codexStopHoldMs)
+        set.add(done)
+        this.pollers.set(sid, set)
+        ctl.onAbort?.(done)
+      })
+    }
+    if (!this.hooksLive() || this.isEnded(sid) || !this.sessions.get(sid)) return {}
+    const q = this.cmds.get(sid) || []
+    if (!q.length) return {}
+    this.cmds.delete(sid)
+    this.continuations.set(sid, (this.continuations.get(sid) || 0) + 1)
+    if (this.sessions.set(sid, { st: 'run' })) this.queueSess(sid)
+    this.log('say_done', { id: q.map((c) => c.id).join(','), ok: true })
+    const text = q.map((c) => c.text).join('\n\n')
+    return { cmd: `Follow-up instruction from the user, sent from their Hinty smart-glasses:\n\n${text}` }
+  }
+
+  /** SessionEnd of Codex / Grok. @param {string} agent @param {unknown} input */
+  agentSessionEnd(agent, input) {
+    const n = this.agentInput(agent, input)
+    if (!n) return { ok: false }
+    return this.endSession(n.sid)
+  }
+
+  /** The session is over: close its cards, forget it, tell the viewer. @param {string} sid */
+  endSession(sid) {
+    this.ended.set(sid, this.now())
+    for (const p of this.perms.list((x) => x.sid === sid)) this.endPerm(p.rid, 'session_end')
+    const s = this.sessions.remove(sid)
+    this.cmds.delete(sid)
+    this.dirty.delete(sid)
+    this.continuations.delete(sid)
+    this.wake(sid)
+    if (s) this.send('sess', { ...this.sessPayload(s), st: 'end' })
+    return { ok: true }
+  }
+
+  // ------------------------------------------------------------------------------------------------
   // Mod (runs inside Claude Code): short polls for commands (a hold of up to 20 s is supported), session events
   // ------------------------------------------------------------------------------------------------
 
@@ -263,6 +449,17 @@ export class Service {
       ctl.onAbort?.(done)
     })
     return take()
+  }
+
+  /** Queue an instruction for a session's next poll / held Stop hook. @param {string} sid @param {string} text */
+  enqueueCmd(sid, text) {
+    const q = this.cmds.get(sid) || []
+    if (q.length >= 10) q.shift()
+    const id = String(++this.cmdSeq)
+    q.push({ id, text })
+    this.cmds.set(sid, q)
+    this.log('say_in', { id })
+    this.wake(sid)
   }
 
   /** @param {string} sid */
@@ -356,6 +553,7 @@ export class Service {
         // N1: link lost = the relay forgets our requests; the hooks end empty at once
         this.releaseAll('link_lost')
         this.voice.dropActive()
+        this.wake()
         return
       case 'audio_start': this.voice.onStart(payload); return
       case 'audio': this.voice.onAudio(payload); return
@@ -376,19 +574,30 @@ export class Service {
       }
       case 'say': {
         if (!isObj(payload) || !exactKeys(payload, 'sid,text')) return
-        const { sid, text } = payload
-        if (typeof sid !== 'string' || typeof text !== 'string' || !text.trim() || text.length > 8000) return
+        const { sid } = payload
+        const raw = payload.text
+        if (typeof sid !== 'string' || typeof raw !== 'string' || !raw.trim() || raw.length > 8000) return
+        // every road to an agent (mod poll, `codex queue`, held Stop) gets a plain message, never a command
+        const text = safeInstruction(raw)
         if (!this.away.isOn() || !this.sessions.get(sid)) {
           this.log('say_refused', { reason: this.away.on ? 'no_session' : 'away_off' })
           return
         }
-        const q = this.cmds.get(sid) || []
-        if (q.length >= 10) q.shift()
-        const id = String(++this.cmdSeq)
-        q.push({ id, text })
-        this.cmds.set(sid, q)
-        this.log('say_in', { id })
-        this.wake(sid)
+        if (this.sessions.get(sid)?.agent === 'grok') {
+          this.log('say_refused', { reason: 'unsupported' })
+          return
+        }
+        const sess = this.sessions.get(sid)
+        if (sess && sess.agent === 'codex' && this.codexQueue && !this.codexQueueBroken) {
+          // Codex 0.171+: `codex queue` puts it in the session as the person's next message
+          this.log('say_in', { via: 'queue' })
+          this.codexQueue(sid, text, sess.home || undefined).then((ok) => {
+            this.log('say_done', { via: 'queue', ok })
+            if (!ok) { this.codexQueueBroken = true; this.enqueueCmd(sid, text) } // fall back to the held Stop hook
+          }, () => { this.codexQueueBroken = true; this.enqueueCmd(sid, text) })
+          return
+        }
+        this.enqueueCmd(sid, text)
         return
       }
       case 'away': {
@@ -484,6 +693,12 @@ export class Service {
       perms: this.perms.list().length,
       voice: { ready: this.voiceReady(), busy: !!this.voice.active },
     }
+  }
+
+  /** An agent's hooks were installed or removed (or the Grok option changed): say `hello` again with the new list. */
+  agentsChanged() {
+    this.hello()
+    return { ok: true, agents: this.agentsInfo().agents }
   }
 
   /** The voice was installed or removed while running: tell the relay again (the contract allows a repeated `hello`). */

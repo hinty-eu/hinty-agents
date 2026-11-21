@@ -5,6 +5,7 @@ import fs from 'node:fs'
 import os from 'node:os'
 import { call, status as daemonStatus } from './client.js'
 import * as claude from './adapters/claude.js'
+import { ADAPTERS, get as getAdapter } from './adapters/index.js'
 import { prettyCode, pair } from './pair.js'
 import { Relay } from './relay.js'
 import { DEFAULT_API, cliEntry, ensureHome, isPaired, paths, pidAlive, readConfig, readDaemonInfo, updateConfig } from './store.js'
@@ -30,8 +31,10 @@ Usage: npx hinty-agents [command]
   (no command)        set up: pair this computer, install the Claude Code plugin, start the service
   status              what runs, the link, away mode, known sessions
   away on|off         away-from-desk mode: while off nothing leaves this computer (it turns itself off after 12 h)
-  install claude      install the Claude Code plugin (hooks + mod) with Claude Code's plugin commands
-  uninstall claude    remove the plugin and its marketplace entry
+  install <agent>     claude: the plugin (hooks + mod) via Claude Code's plugin commands
+                      codex: hooks merged into $CODEX_HOME/hooks.json (then trust them once: /hooks in Codex)
+                      grok: ~/.grok/hooks/hinty.json; add --ask-shell to get a card for every shell command
+  uninstall <agent>   remove what install added (claude | codex | grok)
   doctor              check Node, Claude Code, the plugin, the service and the link
   unpair              disconnect this computer from your Hinty account
   start | stop        start or stop the background service
@@ -55,7 +58,7 @@ export async function main(argv) {
     }
     case 'status': return showStatus()
     case 'away': return away(rest[0])
-    case 'install': return installCmd(rest[0])
+    case 'install': return installCmd(rest[0], rest.slice(1))
     case 'uninstall': return uninstallCmd(rest[0])
     case 'doctor': return doctor()
     case 'unpair': return unpair()
@@ -192,6 +195,14 @@ async function setup(args) {
     else await installCmd('claude')
   }
 
+  for (const other of ['codex', 'grok']) {
+    const a = getAdapter(other)
+    const f = a && a.detect()
+    if (f && f.found && !a.installed().installed) {
+      out(`${c.ok('✓')} ${other === 'codex' ? 'Codex CLI' : 'Grok Build'} ${f.version || ''} found. To follow it too: npx hinty-agents install ${other}`)
+    }
+  }
+
   if (!noStart) {
     const s = await startDaemon()
     if (s) out(`${c.ok('✓')} Service running (pid ${s.pid}), link ${s.relay.connected ? 'connected' : 'connecting...'}`)
@@ -224,7 +235,8 @@ async function showStatus() {
   if (s.voice) out(`Voice:    ${s.voice.ready ? c.ok('ready') : 'not installed (npx hinty-agents voice install)'}`)
   out(`Sessions: ${s.sessions.length ? '' : 'none'}`)
   for (const x of s.sessions) {
-    out(`  ${x.label.padEnd(24)} ${x.agent.padEnd(7)} ${x.st.padEnd(5)} ${x.mod ? 'mod ok' : c.warn('no mod contact')}`)
+    const via = x.agent !== 'claude' ? 'hooks' : x.mod ? 'mod ok' : c.warn('no mod contact')
+    out(`  ${x.label.padEnd(24)} ${x.agent.padEnd(7)} ${x.st.padEnd(5)} ${via}`)
   }
   return 0
 }
@@ -295,26 +307,53 @@ async function away(arg) {
   return 0
 }
 
-/** @param {string | undefined} agent */
-async function installCmd(agent) {
-  if (agent !== 'claude') { out('Usage: npx hinty-agents install claude   (other agents come later)'); return 1 }
-  const cc = claude.detect()
-  if (!cc.found) { out(c.bad('✗ Claude Code (`claude`) not found.')); return 1 }
-  out(`Installing the Claude Code plugin from ${claude.repoRoot()} ...`)
-  const r = claude.install()
+/** After install / uninstall: a running service says `hello` again with the new list of agents. */
+async function tellAgents() {
+  if (!readDaemonInfo()) return
+  try { await call('POST', '/v1/agents/reload') } catch { /* the service did not answer: it reads the files at its next start */ }
+}
+
+/** @param {string | undefined} agent @param {string[]} [flags] */
+async function installCmd(agent, flags = []) {
+  const a = getAdapter(agent)
+  if (!a) { out(`Usage: npx hinty-agents install <${Object.keys(ADAPTERS).join('|')}>`); return 1 }
+  if (agent === 'claude') {
+    const cc = claude.detect()
+    if (!cc.found) { out(c.bad('✗ Claude Code (`claude`) not found.')); return 1 }
+    out(`Installing the Claude Code plugin from ${claude.repoRoot()} ...`)
+    const r = claude.install()
+    for (const s of r.steps) out(`  ${s.ok ? c.ok('✓') : c.bad('✗')} ${s.step}: ${s.message}`)
+    if (r.ok) {
+      updateConfig({ entry: cliEntry() })
+      out(`${c.ok('✓')} Plugin installed (user scope). New sessions load it; in open ones run /reload-plugins or restart.`)
+    }
+    return r.ok ? 0 : 1
+  }
+  const found = a.detect()
+  if (!found.found) out(c.warn(`! ${agent === 'codex' ? 'Codex CLI (`codex`)' : 'Grok Build (`grok`)'} was not found on PATH; installing the hooks anyway (they are only files).`))
+  else out(`${c.ok('✓')} ${agent === 'codex' ? 'Codex CLI' : 'Grok Build'} ${found.version || ''}`)
+  const askShell = agent === 'grok' && flags.includes('--ask-shell')
+  if (agent === 'grok' && askShell) {
+    out(c.warn('! --ask-shell: Grok FAILS OPEN. If the Hinty hook crashes, times out or the service is down, Grok RUNS the step.'))
+    out(c.warn("  \"Allow\" on the glasses only means \"no veto\": Grok's own permission prompts still apply."))
+  }
+  const r = a.install({ askShell })
   for (const s of r.steps) out(`  ${s.ok ? c.ok('✓') : c.bad('✗')} ${s.step}: ${s.message}`)
   if (r.ok) {
     updateConfig({ entry: cliEntry() })
-    out(`${c.ok('✓')} Plugin installed (user scope). New sessions load it; in open ones run /reload-plugins or restart.`)
+    await tellAgents()
+    out(`${c.ok('✓')} ${agent === 'codex' ? 'Codex' : 'Grok'} hooks installed. New sessions pick them up.`)
   }
   return r.ok ? 0 : 1
 }
 
 /** @param {string | undefined} agent */
 async function uninstallCmd(agent) {
-  if (agent !== 'claude') { out('Usage: npx hinty-agents uninstall claude'); return 1 }
-  const r = claude.uninstall()
+  const a = getAdapter(agent)
+  if (!a) { out(`Usage: npx hinty-agents uninstall <${Object.keys(ADAPTERS).join('|')}>`); return 1 }
+  const r = a.uninstall()
   for (const s of r.steps) out(`  ${s.ok ? c.ok('✓') : c.bad('✗')} ${s.step}: ${s.message}`)
+  if (r.ok && agent !== 'claude') await tellAgents()
   return r.ok ? 0 : 1
 }
 
@@ -364,6 +403,22 @@ async function doctor() {
     line(v.ok, v.ok ? 'Plugin and mod pass `claude plugin validate`' : `Plugin does not validate: ${v.errors.slice(0, 2).join('; ')}`)
   }
 
+  for (const other of ['codex', 'grok']) {
+    const a = getAdapter(other)
+    const name = other === 'codex' ? 'Codex CLI' : 'Grok Build'
+    const f = a.detect()
+    const inst = a.installed()
+    if (!f.found && !inst.installed) continue
+    line(null, f.found ? `${name} ${f.version || ''}` : `${name} not found on PATH`)
+    if (other === 'codex') {
+      line(inst.installed ? inst.complete : null, inst.installed ? `Codex hooks: ${inst.events.length} of 6 in ${inst.file}` : 'Codex hooks not installed',
+        inst.installed ? (inst.complete ? 'trusted? open Codex and type /hooks (Codex skips untrusted hooks)' : 'npx hinty-agents install codex') : 'npx hinty-agents install codex')
+      for (const n of a.configNotes()) line(null, n)
+    } else {
+      line(inst.installed ? true : null, inst.installed ? `Grok hooks in ${inst.file}${inst.askShell ? ' (ask-shell ON: Grok fails open)' : ''}` : 'Grok hooks not installed', inst.installed ? undefined : 'npx hinty-agents install grok')
+    }
+  }
+
   const s = await daemonStatus()
   line(!!s, s ? `Service running (pid ${s.pid})` : 'Service not running', s ? undefined : 'npx hinty-agents start')
   if (s) {
@@ -373,10 +428,11 @@ async function doctor() {
     let h = null
     try { h = JSON.parse(hook.stdout) } catch { /* no answer */ }
     line(!!(h && h.ok), h && h.ok ? `Hook reaches the service (${h.ms} ms)` : 'Hook cannot reach the service')
-    const withMod = s.sessions.filter((/** @type {any} */ x) => x.mod)
-    const noMod = s.sessions.filter((/** @type {any} */ x) => !x.mod)
-    if (!s.sessions.length) line(null, 'No Claude Code session seen yet (open one to check the mod)')
-    else line(noMod.length ? null : true, `Mod active in ${withMod.length} of ${s.sessions.length} session(s)`,
+    const claudeSessions = s.sessions.filter((/** @type {any} */ x) => x.agent === 'claude')
+    const withMod = claudeSessions.filter((/** @type {any} */ x) => x.mod)
+    const noMod = claudeSessions.filter((/** @type {any} */ x) => !x.mod)
+    if (!claudeSessions.length) line(null, 'No Claude Code session seen yet (open one to check the mod)')
+    else line(noMod.length ? null : true, `Mod active in ${withMod.length} of ${claudeSessions.length} session(s)`,
       noMod.length ? 'sessions without the mod: mods may be off (disableAllHooks / allowManagedModsOnly) or the session predates the plugin' : undefined)
   }
   out(bad ? c.bad(`\n${bad} problem(s).`) : c.ok('\nAll good.'))

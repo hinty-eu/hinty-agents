@@ -85,6 +85,9 @@ export function permText(tool, input) {
     case 'PowerShell':
       out = s(i.command) + (s(i.description) ? `\n\n# ${s(i.description)}` : '')
       break
+    case 'apply_patch':
+      out = s(i.command) || s(i.input)
+      break
     case 'Write':
       out = `${s(i.file_path)}\n\n${s(i.content).slice(0, 3000)}`
       break
@@ -122,4 +125,24 @@ export function permText(tool, input) {
 export function baseLabel(cwd) {
   const name = String(cwd || '').split(/[\\/]+/).filter(Boolean).pop() || 'session'
   return oneLine(name, 50) || 'session'
+}
+
+const TRIGGERS = new Set(['/', '!', '#', '@', '$'])
+
+/**
+ * An instruction from the glasses or panel must reach an agent as a plain message, never as a command: Claude Code reads
+ * `!` as bash mode, `/` as a slash command and `#` as a memory note; OpenClaw runs `/approve <id> allow-always` sent as
+ * chat text. For EVERY line that, after leading white space (any Unicode `\s`), starts with / ! # @ or $, the white space
+ * is removed and a zero-width space is put in front. Other text is returned byte for byte.
+ * @param {string} text
+ */
+export function safeInstruction(text) {
+  return String(text ?? '')
+    .split(/(\r\n|[\r\n\u000b\u000c\u0085\u2028\u2029])/)
+    .map((part, i) => {
+      if (i % 2 === 1) return part // the separators
+      const bare = part.replace(/^\s+/u, '')
+      return bare && TRIGGERS.has(bare[0]) ? `\u200b${bare}` : part
+    })
+    .join('')
 }

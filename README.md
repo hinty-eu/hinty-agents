@@ -1,8 +1,8 @@
 # hinty-agents
 
 Approve or deny your AI coding agent's permission prompts, and follow what each session is doing, from Hinty
-smart-glasses or the Hinty web panel while you are away from the desk. Claude Code first; Codex, Grok Build, OpenClaw
-and Hermes later.
+smart-glasses or the Hinty web panel while you are away from the desk. Claude Code, Codex CLI and Grok Build today;
+OpenClaw and Hermes later.
 
 ```
 api       asks to run: npm run test:e2e        [Allow once] [Deny]
@@ -88,7 +88,7 @@ npx hinty-agents away off     # back at the desk
 | `npx hinty-agents` | set up (options: `--no-install`, `--no-start`, `--label <name>`) |
 | `status` | service, link, away mode, sessions |
 | `away on\|off` | away-from-desk mode |
-| `install claude` / `uninstall claude` | add or remove the Claude Code plugin |
+| `install <claude\|codex\|grok>` / `uninstall <...>` | add or remove an agent's integration (`install grok --ask-shell`: see Grok Build) |
 | `doctor` | checks Node, Claude Code, the plugin (`claude plugin validate`), the service, the link, the hook and whether the mod reports in |
 | `unpair` | disconnect this computer from your account and delete the token |
 | `voice install` / `status` / `remove` | local speech to text for dictation from the glasses (see Voice) |
@@ -98,6 +98,68 @@ After a reboot the SessionStart hook starts the service again (unless you ran `s
 
 Environment: `HINTY_AGENTS_API` (server for a new pairing, default `https://api.v1.hinty.eu`),
 `HINTY_AGENTS_HOME` (data folder, default `~/.hinty-agents`).
+
+## Codex CLI
+
+```bash
+npx hinty-agents install codex      # merges 6 hooks into $CODEX_HOME/hooks.json (default ~/.codex)
+npx hinty-agents uninstall codex    # removes exactly those entries
+```
+
+Needs Codex CLI 0.171 or newer for instructions (`codex queue`); permission cards and status work with any version that
+has hooks. Your own `hooks.json` entries and `config.toml` are never touched: install adds our entries, keeps a copy of
+your file once (`hooks.json.hinty-agents.bak`), and uninstall removes only ours. If `config.toml` also declares `[hooks]`
+or switches hooks off, install says so.
+
+**Trust (once).** Codex runs a new hook only after you trust it. At its next start Codex shows *Hooks need review*:
+choose *Trust all and continue* (or review them later with `/hooks`). Until then nothing of Hinty runs in Codex.
+
+| | |
+|---|---|
+| Permission cards | `PermissionRequest` hook: allow once or deny from the glasses or the panel. Same rules as Claude Code (N1-N3, N8, N11). |
+| Session state | `SessionStart`, `UserPromptSubmit`, `PostToolUse`, `Stop`, `SessionEnd`: the session appears next to your Claude Code ones (`agent: codex`), with the 👓 line from the final answer. |
+| Instructions | `codex queue --thread <session> --message <text>`: Codex shows it as your next message, also in an idle session at the prompt. No shell is involved (the text is one argument). Fallback for a Codex without `queue`: the `Stop` hook is held (up to 9 minutes, 8 instructions in a row) and answers `{"decision":"block","reason":<text>}`; Codex then continues with it. |
+
+Limits worth knowing:
+- **While a card waits, Codex shows no prompt in the terminal.** Codex asks you only after the hook has answered (checked
+  live on 0.171), unlike Claude Code, which shows both at once. If you are back at the desk, `npx hinty-agents away off`
+  (or switch it off in the panel) releases the waiting hook at once and the terminal asks as usual (measured: ~0.4 s).
+  Unanswered cards expire after 570 s with the same result.
+- Away mode off, service down or link lost: the hooks print nothing and finish in ~0.1 s (median 127 ms on Windows).
+- With the held-`Stop` fallback the Codex input bar shows "Running hooks" while the hook waits.
+- An instruction that is a Codex slash command is not run as one: every instruction is sent as plain text (see Instructions
+  are plain text below).
+
+## Grok Build
+
+```bash
+npx hinty-agents install grok                # session status only
+npx hinty-agents install grok --ask-shell    # plus a card for every risky shell command
+npx hinty-agents uninstall grok
+```
+
+Writes `~/.grok/hooks/hinty.json` (an existing file of that name that is not ours is backed up and restored by
+uninstall). Not tested on a live Grok Build (it needs a paid xAI account); the hook scripts and the whole bridge are tested
+with Grok's documented hook input and output (docs.x.ai/build/features/hooks).
+
+**Read this before `--ask-shell`: Grok hooks fail open.** Grok can block a step only from `PreToolUse`, and when the hook
+crashes, times out or the service is down, Grok **runs the step**. So with `--ask-shell`:
+- a card appears for each shell command that is not on the harmless list (`ls`, `pwd`, `cat`, `git status|diff|log`, ...;
+  every chained segment must match, and `$(...)`, backticks and redirection are never harmless). Own list:
+  `"grok": {"except": [...]}` in `~/.hinty-agents/config.json`;
+- **Deny** vetoes the step. **Allow** only means "no veto": Grok's own permission prompt still applies;
+- if nobody answers within 280 s, the service is down, away mode is off or anything fails, the step runs (as Grok does with
+  any failing hook). Do not use this as a security boundary; Grok's own `deny` rules and sandbox are the guarantee.
+
+Without `--ask-shell` only the passive hooks are installed. Grok ignores the output of those, so there is no glasses line
+and **instructions from the glasses are not supported** for Grok sessions.
+
+## Instructions are plain text
+
+Whatever you send from the glasses or the panel reaches the agent as an ordinary message, never as a command: Claude Code
+treats a leading `!` as bash mode (no permission), `/` as a slash command and `#` as a memory note, and OpenClaw runs a
+chat line `/approve <id> allow-always` as an approval. The service puts a zero-width space in front of every line that,
+after leading white space, starts with `/`, `!`, `#`, `@` or `$`. Other text is passed byte for byte.
 
 ## Voice (dictate to your agents from the glasses)
 
