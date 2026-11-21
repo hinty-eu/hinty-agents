@@ -2,6 +2,30 @@
   "name": "hinty-agents",
   "version": "0.3.0",
   "description": "Supervise your AI coding agents (Claude Code first) from Hinty smart-glasses and the Hinty web panel: approve or deny permission prompts, see session status, send follow-up instructions.",
+  "keywords": [
+    "claude-code",
+    "codex",
+    "grok",
+    "openclaw",
+    "hermes",
+    "ai-agents",
+    "smart-glasses",
+    "even-g2",
+    "permissions",
+    "hooks",
+    "mcp"
+  ],
+  "homepage": "https://www.hinty.eu/assistant/agents",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/hinty-eu/hinty-agents.git"
+  },
+  "bugs": {
+    "url": "https://github.com/hinty-eu/hinty-agents/issues",
+    "email": "support@hinty.eu"
+  },
+  "license": "MIT",
+  "author": "Hinty <support@hinty.eu> (https://www.hinty.eu)",
   "type": "module",
   "bin": {
     "hinty-agents": "bin/hinty-agents.js"
@@ -14,7 +38,10 @@
     "hooks/",
     ".claude-plugin/",
     "README.md",
+    "CHANGELOG.md",
+    "SECURITY.md",
     "LICENSE",
+    "!claude-plugin/.claude-plugin/types/**",
     "!**/__pycache__/**",
     "!**/*.pyc"
   ],
@@ -27,7 +54,5 @@
   },
   "dependencies": {
     "socket.io-client": "^4.8.3"
-  },
-  "license": "MIT",
-  "private": true
+  }
 }

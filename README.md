@@ -1,5 +1,9 @@
 # hinty-agents
 
+[![npm](https://img.shields.io/npm/v/hinty-agents)](https://www.npmjs.com/package/hinty-agents) [![license](https://img.shields.io/npm/l/hinty-agents)](LICENSE)
+
+![Claude Code permission prompts approved from Hinty smart-glasses](docs/hinty-agents.gif)
+
 Approve or deny your AI coding agent's permission prompts, and follow what each session is doing, from Hinty
 smart-glasses or the Hinty web panel while you are away from the desk. Claude Code, Codex CLI, Grok Build, OpenClaw and Hermes Agent.
 
@@ -10,6 +14,8 @@ web       done: fixed the signup form, 3 files
 
 It is a small Node.js service that runs on your computer, plus a Claude Code plugin (two hooks and a mod). The code
 is open because it approves commands on your machine: read it before you run it.
+
+More: [hinty.eu/assistant/agents](https://www.hinty.eu/assistant/agents) · privacy: [hinty.eu/privacy#agents](https://www.hinty.eu/privacy#agents) · vulnerabilities: [SECURITY.md](SECURITY.md) · [CHANGELOG.md](CHANGELOG.md)
 
 ## How it works
 
@@ -111,14 +117,24 @@ The Claude Code mod writes an instruction's id and length (not its text) to Clau
 
 Requirements: Node.js 20+, Claude Code (`claude`) with mods enabled (default since 2.1.287), a Hinty account.
 
-Not on npm yet; run it from a clone:
+Run it with `npx`. **Pin the version** (the hooks run on your machine, so you decide when to update):
 
 ```bash
-git clone <this repository> hinty-agents
-cd hinty-agents
-npm install
-npx hinty-agents
+npx hinty-agents@0.3.0
 ```
+
+Or straight from GitHub (a tag, not a branch):
+
+```bash
+npx github:hinty-eu/hinty-agents#v0.3.0
+```
+
+**Where it lives.** `npx` runs from npm's cache, which npm may clean at any time. So setup (and `start`, `install`)
+first copies the program, with its one dependency `socket.io-client`, to `~/.hinty-agents/app/<version>/`
+(`HINTY_AGENTS_HOME/app/<version>/` if you set it) and uses only that copy: the service, the Codex / Grok / Hermes hook
+files and the Claude Code plugin marketplace point there. Reading the code you run: `~/.hinty-agents/app/<version>/src`.
+Running another version copies it next to the old one; the previous version is kept, older ones are removed. A git
+checkout (a `.git` folder, or `HINTY_AGENTS_DEV=1`) runs in place, without a copy.
 
 The wizard checks Node and Claude Code, shows a pairing code (type it in the Hinty panel: Voice Assistant → Agents),
 then asks for the 4-digit number the panel shows after the code (run it in a terminal: piped input is refused), stores
@@ -126,11 +142,12 @@ the token in `~/.hinty-agents/config.json`, installs the Claude Code plugin with
 the service. The plugin step is the same as running:
 
 ```bash
-claude plugin marketplace add <path to this folder> --scope user
+claude plugin marketplace add ~/.hinty-agents/app/<version> --scope user
 claude plugin install hinty-agents@hinty-agents --scope user
 ```
 
-New Claude Code sessions load it (open ones: `/reload-plugins` or restart). Then, when you leave the desk:
+New Claude Code sessions load it (open ones: `/reload-plugins` or restart). Installing a newer version updates the
+marketplace and the plugin too; `doctor` tells you when the plugin and the service are different versions. Then, when you leave the desk:
 
 ```bash
 npx hinty-agents away on      # or in the panel, if you allowed remote switch-on
@@ -142,6 +159,7 @@ npx hinty-agents away off     # back at the desk (the panel and the glasses can 
 | Command | |
 |---|---|
 | `npx hinty-agents` | set up (options: `--no-install`, `--no-start`, `--label <name>`) |
+| `uninstall --all` | remove everything (see Uninstall) |
 | `status` | service, link, away mode, sessions |
 | `away on\|off` | away-from-desk mode |
 | `remote-away on\|off` | allow (or not) the Hinty panel / glasses to switch away mode ON (default off; off always works) |
@@ -344,6 +362,19 @@ npx hinty-agents voice remove       # deletes the engine and every model
 
 ## Uninstall
 
+Everything in one go:
+
+```bash
+npx hinty-agents uninstall --all
+```
+
+It removes the hooks and plugins of every agent you installed (Claude Code plugin and marketplace, Codex, Grok, OpenClaw,
+Hermes), unpairs this computer (revokes the token), stops the service, deletes `~/.hinty-agents/app/` and asks whether
+to delete the rest of `~/.hinty-agents` too (`--purge` deletes it without asking, `--keep-data` keeps it). `npx` keeps
+its own cache; `npm cache clean --force` empties it.
+
+One at a time:
+
 ```bash
 npx hinty-agents uninstall claude   # removes the plugin and the marketplace entry
 npx hinty-agents uninstall openclaw # deletes both device keys and tokens (then: openclaw devices remove <id>, twice)
@@ -351,8 +382,6 @@ npx hinty-agents uninstall hermes   # restores your Hermes settings and removes 
 npx hinty-agents unpair             # revokes this computer and deletes the token
 npx hinty-agents stop
 ```
-
-Then delete the folder and `~/.hinty-agents`.
 
 ## Development
 
@@ -362,6 +391,7 @@ claude --plugin-dir ./claude-plugin           # load the plugin from this folder
 claude plugin validate ./claude-plugin        # check the manifest, hooks and mod
 ```
 
+Run from a clone (`git clone https://github.com/hinty-eu/hinty-agents`, `npm install`, `node bin/hinty-agents.js`): a checkout runs in place, no copy.
 Use `HINTY_AGENTS_HOME` and `HINTY_AGENTS_API` to keep a test service away from your real one. Plain JavaScript with
 JSDoc types (no build step); the only dependency is `socket.io-client` (the speech engine and models are installed on
 demand by `voice install`). The mod's types come from Claude Code: once it has loaded the plugin,
@@ -376,6 +406,11 @@ Known limits:
   and instructions do not. Planned fallback: hold the `Stop` hook while away and hand the instruction over as
   `additionalContext`.
 - Pick-from-a-list questions (AskUserQuestion) show as "asks, answer at the computer".
+
+## Security and privacy
+
+Found a vulnerability? See [SECURITY.md](SECURITY.md). What the Hinty server sees and keeps:
+[hinty.eu/privacy#agents](https://www.hinty.eu/privacy#agents).
 
 ## License
 

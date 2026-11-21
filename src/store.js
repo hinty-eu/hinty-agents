@@ -8,6 +8,7 @@ import { spawnSync } from 'node:child_process'
 import { fileURLToPath } from 'node:url'
 import { isAbsPath, sysExe } from './exec.js'
 import { PV } from './localauth.js'
+import { activeRoot } from './root.js'
 
 export const DEFAULT_API = 'https://api.v1.hinty.eu'
 
@@ -215,4 +216,4 @@ export function pidAlive(pid) {
 }
 
 /** Absolute path of the CLI entry (used to start the service from the SessionStart hook). */
-export const cliEntry = () => fileURLToPath(new URL('../bin/hinty-agents.js', import.meta.url))
+export const cliEntry = () => path.join(activeRoot(), 'bin', 'hinty-agents.js')

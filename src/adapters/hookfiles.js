@@ -6,13 +6,13 @@ import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
 import { spawnSync } from 'node:child_process'
-import { fileURLToPath } from 'node:url'
+import { activeRoot } from '../root.js'
 import { childEnv, sysExe } from '../exec.js'
 import { ensureHome, homeDir } from '../store.js'
 
 export const SCRIPTS = ['common.cjs', 'codex-hook.cjs', 'grok-hook.cjs']
 
-export const sourceDir = () => path.resolve(fileURLToPath(new URL('../../hooks/', import.meta.url)))
+export const sourceDir = () => path.join(activeRoot(), 'hooks')
 export const hooksDir = () => path.join(homeDir(), 'hooks')
 
 /** Copy the scripts into the data folder; returns the folder. */

@@ -15,6 +15,7 @@ import os from 'node:os'
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { homeDir, readJson, writeJson } from '../store.js'
+import { activeRoot } from '../root.js'
 import { glassesLine } from '../text.js'
 import { SID_RE } from '../sessions.js'
 import { resolveProgram, runSync } from '../exec.js'
@@ -27,7 +28,7 @@ export const MIN_VERSION = '0.21.5'
 /** Hermes's documented defaults when a key is absent. */
 const DEFAULTS = { transport: 'builtin', fallback: 'deny', injection: null }
 
-export const pluginSource = () => fileURLToPath(new URL('../../hermes-plugin/hinty-agents', import.meta.url))
+export const pluginSource = () => path.join(activeRoot(), 'hermes-plugin', 'hinty-agents')
 export const hermesHome = () => process.env.HERMES_HOME
   || (process.platform === 'win32' && process.env.LOCALAPPDATA ? path.join(process.env.LOCALAPPDATA, 'hermes') : path.join(os.homedir(), '.hermes'))
 export const pluginDir = () => path.join(hermesHome(), 'plugins', PLUGIN)

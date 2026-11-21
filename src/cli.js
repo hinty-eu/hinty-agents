@@ -11,6 +11,7 @@ import { childEnv, hardenEnv, isOurDaemonLine, processCommandLine, sysExe } from
 import { hhmm } from './notify.js'
 import { CHECK_TRIES, checkMatches, prettyCode, pair } from './pair.js'
 import { Relay } from './relay.js'
+import { appBase, ensureApp } from './app.js'
 import { DEFAULT_API, cliEntry, ensureHome, homeAccess, homeDir, isPaired, paths, pidAlive, readConfig, readDaemonAny, readDaemonInfo, updateConfig } from './store.js'
 import { oneLine } from './text.js'
 import { MODELS } from './stt/models.js'
@@ -43,6 +44,8 @@ Usage: npx hinty-agents [command]
                       openclaw: pairs once with your local Gateway (--token-file <file> if the token is a secret reference)
                       hermes: plugin into Hermes's plugins folder + 3 Hermes settings (undone by uninstall)
   uninstall <agent>   remove what install added (claude | codex | grok | openclaw | hermes)
+  uninstall --all     remove everything: all agents, the plugin, the service, the pairing and the program copy
+                      (asks about your data folder; --purge deletes it, --keep-data keeps it, without asking)
   doctor              check Node, Claude Code, the plugin, the service and the link
   unpair              disconnect this computer from your Hinty account
   start | stop        start or stop the background service
@@ -50,7 +53,7 @@ Usage: npx hinty-agents [command]
   voice status|remove show what is installed / delete the voice packages and models
 
 Setup options: --no-install (skip the plugin), --no-start (do not start the service), --label <name>
-Server: ${DEFAULT_API} (override with HINTY_AGENTS_API). Data: ~/.hinty-agents (override with HINTY_AGENTS_HOME).`
+Server: ${DEFAULT_API} (override with HINTY_AGENTS_API). Data: ~/.hinty-agents (override with HINTY_AGENTS_HOME); the program is copied to ~/.hinty-agents/app/<version>.`
 
 /** @param {string[]} argv @returns {Promise<number>} */
 export async function main(argv) {
@@ -81,7 +84,7 @@ async function dispatch(cmd, rest, argv) {
     case 'away': return away(rest[0])
     case 'remote-away': return remoteAwayCmd(rest[0])
     case 'install': return installCmd(rest[0], rest.slice(1))
-    case 'uninstall': return uninstallCmd(rest[0])
+    case 'uninstall': return rest.includes('--all') ? uninstallAll(rest) : uninstallCmd(rest[0])
     case 'doctor': return doctor()
     case 'unpair': return unpair()
     case 'start': return start()
@@ -194,6 +197,23 @@ const REMOTE_AWAY_TEXT = [
 // Service lifecycle
 // ------------------------------------------------------------------------------------------------
 
+/**
+ * Switch to the stable copy of the program (app.js): the service, the agents' hook files and the Claude Code plugin
+ * marketplace must not point into an npx cache folder npm may clean. A git checkout is used as it is.
+ * @returns {boolean} false when the copy could not be made (the message is printed)
+ */
+function useStableCopy() {
+  try {
+    const r = ensureApp()
+    if (r.copied) out(`${c.ok('✓')} Program copied to ${r.root} (the service and the plugin use this copy, not npm's cache).`)
+    if (r.removed.length) out(c.dim(`  removed old: ${r.removed.join(', ')}`))
+    return true
+  } catch (e) {
+    out(c.bad(`✗ Could not copy the program to ${appBase()}: ${e instanceof Error ? e.message : e}`))
+    return false
+  }
+}
+
 /** @returns {Promise<any | null>} status of the running (or just started) service */
 export async function startDaemon() {
   updateConfig({ stopped: false, entry: cliEntry() })
@@ -212,6 +232,7 @@ export async function startDaemon() {
 }
 
 async function start() {
+  if (!useStableCopy()) return 1
   const cfg = readConfig()
   if (!isPaired(cfg)) { out('Not paired yet. Run: npx hinty-agents'); return 1 }
   const old = olderServicePid()
@@ -282,6 +303,7 @@ async function setup(args) {
   else out(`${c.warn('!')} Claude Code not found (\`claude\`). Install it first to use the plugin: https://code.claude.com`)
 
   ensureHome()
+  if (!useStableCopy()) return 1
   let cfg = readConfig()
   if (isPaired(cfg) && cfg) {
     out(`${c.ok('✓')} Already paired with ${cfg.api} as "${oneLine(cfg.label || '?', 60)}"${cfg.account ? ` (account ${cfg.account})` : ''} (to pair again: npx hinty-agents unpair)`)
@@ -515,6 +537,7 @@ async function away(arg) {
   if (!isPaired(cfg)) { out('Not paired yet. Run: npx hinty-agents'); return 1 }
   if (!(await daemonStatus())) {
     if (!on) { out('Away mode is off (the service is not running).'); return 0 }
+    if (!useStableCopy()) return 1
     if (!(await startDaemon())) { out(c.bad(`The service did not start. See ${paths().log}`)); return 1 }
   }
   const r = await call('POST', '/v1/away', { on })
@@ -538,6 +561,7 @@ async function tellAgents() {
 async function installCmd(agent, flags = []) {
   const a = getAdapter(agent)
   if (!a) { out(`Usage: npx hinty-agents install <${Object.keys(ADAPTERS).join('|')}>`); return 1 }
+  if (!useStableCopy()) return 1
   if (agent === 'claude') {
     const cc = claude.detect()
     if (!cc.found) { out(c.bad('✗ Claude Code (`claude`) not found.')); return 1 }
@@ -581,6 +605,41 @@ async function uninstallCmd(agent) {
   return r.ok ? 0 : 1
 }
 
+/**
+ * `uninstall --all`: every agent's hooks, the Claude Code plugin, the service, the pairing, the program copy and (after
+ * asking) the data folder. Each step is tolerant: what is not there is skipped.
+ * @param {string[]} flags
+ */
+async function uninstallAll(flags) {
+  let bad = 0
+  for (const id of Object.keys(ADAPTERS)) {
+    const a = ADAPTERS[id]
+    let present = false
+    try { present = id === 'claude' ? claude.detect().found && claude.installed().installed : !!a.installed().installed } catch { present = false }
+    if (!present) continue
+    out(`Removing ${id === 'claude' ? 'the Claude Code plugin' : NAMES[id]} ...`)
+    const r = await a.uninstall()
+    for (const s of r.steps) out(`  ${s.ok ? c.ok('✓') : c.bad('✗')} ${s.step}: ${s.message}`)
+    if (!r.ok) bad++
+  }
+  if (isPaired(readConfig())) await unpair()
+  await stop()
+  const home = homeDir()
+  let wipe = flags.includes('--purge')
+  if (!wipe && !flags.includes('--keep-data')) {
+    if (interactive()) wipe = await askYes(`Delete your Hinty Agents data folder ${home} (settings, logs, voice models)? [y/N] `)
+    else out(`The data folder ${home} is kept (no terminal to ask; --purge deletes it).`)
+  }
+  // the program copy last: this process may be running from it
+  const target = wipe ? home : appBase()
+  let gone = false
+  try { fs.rmSync(target, { recursive: true, force: true }); gone = !fs.existsSync(target) } catch { /* reported below */ }
+  if (gone) out(`${c.ok('✓')} Removed ${target}`)
+  else { bad++; out(c.bad(`✗ Could not remove ${target} (a file is in use?). Delete it by hand.`)) }
+  out(bad ? c.bad(`\n${bad} step(s) need attention.`) : c.ok('\nEverything is removed. (npx keeps its own cache; `npm cache clean --force` empties it.)'))
+  return bad ? 1 : 0
+}
+
 async function unpair() {
   const cfg = readConfig()
   if (!isPaired(cfg) || !cfg) { out('This computer is not paired.'); return 0 }
@@ -617,6 +676,13 @@ async function doctor() {
       acc.ok ? undefined : process.platform === 'win32' ? 'move it into your user profile (unset HINTY_AGENTS_HOME) or fix its access in Properties -> Security' : `chmod 700 "${homeDir()}" (and make sure you own it)`)
   }
 
+  // the service is started (also after a reboot) from the program copy recorded at install; it must still be there
+  if (cfg && cfg.entry) {
+    const there = fs.existsSync(cfg.entry)
+    const fromCopy = cfg.entry.startsWith(appBase())
+    line(there, there ? `Program ${fromCopy ? 'copy' : 'folder'}: ${cfg.entry}` : `The program folder is gone: ${cfg.entry}`, there ? undefined : 'npx hinty-agents@latest start')
+  }
+
   const cc = claude.detect()
   line(cc.found, cc.found ? `Claude Code ${cc.version}` : 'Claude Code not found')
   if (cc.found) {
@@ -624,6 +690,8 @@ async function doctor() {
     line(inst.installed && inst.enabled, inst.installed ? `Plugin ${claude.PLUGIN_ID} ${inst.version || ''} ${inst.enabled ? 'enabled' : 'DISABLED'}${inst.folder ? ` (${inst.folder})` : ''}` : 'Plugin not installed', inst.installed ? undefined : 'npx hinty-agents install claude')
     // the plugin and this service must speak the same local protocol; an older plugin stays silent
     if (inst.installed && inst.version && inst.version !== VERSION) line(false, `Plugin ${inst.version} is not this version (${VERSION}): its hooks stay silent`, 'npx hinty-agents install claude')
+    // a directory plugin loads in place from the marketplace folder: if that folder is gone the plugin does nothing
+    if (inst.installed && inst.folder && !fs.existsSync(inst.folder)) line(false, `The plugin's folder is gone: ${inst.folder}`, 'npx hinty-agents install claude')
     const v = claude.validate(inst.folder && fs.existsSync(inst.folder) ? inst.folder : claude.pluginDir())
     line(v.ok, v.ok ? 'Plugin and mod pass `claude plugin validate`' : `Plugin does not validate: ${v.errors.slice(0, 2).join('; ')}`)
   }

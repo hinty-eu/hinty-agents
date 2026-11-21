@@ -8,7 +8,7 @@
 // (`disableAllHooks`, `allowManagedModsOnly`), hold the Stop hook in away mode and hand the instruction over as
 // `hookSpecificOutput.additionalContext` (not `decision: block`, which shows "Stop hook error"); limit 8 in a row.
 import path from 'node:path'
-import { fileURLToPath } from 'node:url'
+import { activeRoot } from '../root.js'
 import { resolveProgram, runSync } from '../exec.js'
 
 export const id = 'claude'
@@ -17,7 +17,7 @@ export const MARKETPLACE = 'hinty-agents'
 export const PLUGIN_ID = `${PLUGIN}@${MARKETPLACE}`
 export const caps = { perm: 'prompt-only', say: 'mod' }
 
-export const repoRoot = () => path.resolve(fileURLToPath(new URL('../../', import.meta.url)))
+export const repoRoot = () => activeRoot()
 export const pluginDir = () => path.join(repoRoot(), 'claude-plugin')
 
 /**
@@ -60,6 +60,14 @@ export function install() {
   const inst = run(['plugin', 'install', PLUGIN_ID, '--scope', 'user', '--json'])
   const i = lastJson(inst.stdout)
   steps.push({ step: 'install', ok: inst.ok, message: i?.message || inst.stderr.trim().slice(0, 300) })
+  // A directory plugin loads in place from the marketplace folder (our stable copy). Re-adding the marketplace pointed it
+  // at the new copy; an already installed plugin only learns the new version through `plugin update`.
+  if (inst.ok && i && i.installedVersion && i.availableVersion && i.installedVersion !== i.availableVersion) {
+    const up = run(['plugin', 'update', PLUGIN_ID, '--scope', 'user', '--json'])
+    const u = lastJson(up.stdout)
+    steps.push({ step: 'update', ok: up.ok, message: u?.message || up.stderr.trim().slice(0, 300) })
+    return { ok: up.ok, steps }
+  }
   return { ok: inst.ok, steps }
 }
 
