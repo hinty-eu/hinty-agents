@@ -15,7 +15,7 @@ import os from 'node:os'
 import path from 'node:path'
 import { resolveProgram, runSync } from '../exec.js'
 import { readConfig } from '../store.js'
-import { checkCommandNode, hooksDir, installScripts, nodeCommand, q } from './hookfiles.js'
+import { checkCommandNode, cmdOnlyNode, hooksDir, installScripts, nodeCommand, probeHook, q } from './hookfiles.js'
 
 export const id = 'grok'
 export const caps = { perm: 'veto-only', say: 'none' }
@@ -96,6 +96,10 @@ export function install(o = {}) {
   fs.writeFileSync(file, JSON.stringify(buildConfig(o), null, 2) + '\n')
   steps.push({ step: 'hooks', ok: true, message: `${file}${o.askShell ? ' (with --ask-shell)' : ''}` })
   steps.push({ step: 'node', ok: true, message: `the hooks start Node.js by its full path (${nodeCommand()}); if you remove or move this Node.js, run install grok again (doctor checks it)` })
+  if (cmdOnlyNode()) steps.push({ step: 'WARNING', ok: true, message: 'Node.js is in a folder with spaces and this drive has no short (8.3) names: the hook command starts in cmd.exe only, not in PowerShell or sh. If Grok uses another shell, install Node.js in a folder without spaces and run install grok again.' })
+  // the command really starts (review 3, P3); with --ask-shell a hook that does not start = no veto at all (Grok fails open)
+  const probe = probeHook(commandFor('SessionStart'), 'grok')
+  steps.push({ step: 'check', ok: probe.ok !== false, message: probe.ok === false && o.askShell ? `${probe.text}: Grok would RUN every shell step without asking the glasses` : probe.text })
   steps.push({
     step: 'trust', ok: true,
     message: 'personal hooks (~/.grok/hooks) are read at the next Grok session; check /hooks in Grok\'s extensions modal',
@@ -107,7 +111,7 @@ export function install(o = {}) {
         '"Allow" on the glasses only means "no veto"; Grok\'s own permission prompts still apply.',
     })
   }
-  return { ok: true, steps }
+  return { ok: probe.ok !== false, steps }
 }
 
 /** @returns {{ ok: boolean, steps: Array<{ step: string, ok: boolean, message: string }> }} */
@@ -128,15 +132,18 @@ export function uninstall() {
 }
 
 /**
- * @returns {{ installed: boolean, askShell: boolean, file: string, node: { ok: boolean, node: string, byName: boolean } | null }}
- *   node: the Node.js the hook commands start (doctor checks it)
+ * @returns {{ installed: boolean, askShell: boolean, file: string, node: { ok: boolean, node: string, byName: boolean } | null, command: string | null }}
+ *   node: the Node.js the hook commands start (doctor checks it); command: one of our hook commands, the PreToolUse one
+ *   when there is one (doctor runs it with --ping)
  */
 export function installed() {
   const file = hooksFile()
-  if (!isOurFile(file)) return { installed: false, askShell: false, file, node: null }
+  if (!isOurFile(file)) return { installed: false, askShell: false, file, node: null, command: null }
   let askShell = false
   /** @type {{ ok: boolean, node: string, byName: boolean } | null} */
   let node = null
+  /** @type {string | null} */
+  let command = null
   try {
     const hooks = JSON.parse(fs.readFileSync(file, 'utf8'))?.hooks || {}
     askShell = !!hooks.PreToolUse
@@ -146,11 +153,12 @@ export function installed() {
           if (typeof h?.command !== 'string' || !h.command.includes(MARKER)) continue
           const n = checkCommandNode(h.command)
           if (!node || (node.ok && !n.ok)) node = n
+          if (!command || / PreToolUse\b/.test(h.command)) command = h.command
         }
       }
     }
   } catch { /* unreadable */ }
-  return { installed: true, askShell, file, node }
+  return { installed: true, askShell, file, node, command }
 }
 
 /** Is ask-shell on (installed with --ask-shell)? */

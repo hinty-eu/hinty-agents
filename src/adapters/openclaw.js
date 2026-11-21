@@ -17,7 +17,8 @@
 //         removed, `label:` at a line start removed, `\n` written out as text = a space) can never remove, so the
 //         message never starts with `/` or `!`;
 //      3. `disarm`: a zero-width space before every `/` or `!` that follows the start, white space, `]`, `:` or a written
-//         out `\n`, and OpenClaw's "current message" marker broken up.
+//         out `\n`, OpenClaw's "current message" marker broken with a visible character (so layer 2 never depends on
+//         zero-width characters), and every message checked with a copy of OpenClaw's clean-up before it is sent.
 //  Z5  the card shows every field of the request that changes what runs (argv, preview, env keys, resolved path,
 //      policy); env values are never sent to us, and a field we do not know, so such a card is incomplete (`part`).
 import crypto from 'node:crypto'
@@ -186,7 +187,7 @@ function previousDevices() {
  * Pair two devices with the Gateway (the first loopback connection pairs by itself): `approver` (read + approvals) and
  * `writer` (read + write), each with its own device token (Z1). The shared Gateway token is used for these two
  * connections only and is not stored anywhere. A 0.2.x pairing (one token with every scope) is replaced.
- * @param {{ tokenFile?: string, url?: string, WebSocketImpl?: any }} [o]
+ * @param {{ tokenFile?: string, url?: string, WebSocketImpl?: any, retryMs?: number, connectTimeoutMs?: number }} [o] retryMs, connectTimeoutMs: tests
  * @returns {Promise<{ ok: boolean, steps: Array<{ step: string, ok: boolean, message: string }> }>}
  */
 export async function install(o = {}) {
@@ -202,47 +203,78 @@ export async function install(o = {}) {
     steps.push({ step: 'token', ok: false, message: `no Gateway token found in ${configPath()} (or OPENCLAW_GATEWAY_TOKEN); pass --token-file <file>` })
     return { ok: false, steps }
   }
-  const before = previousDevices()
+  const before = [...previousDevices(), ...readOrphans().map((x) => x.deviceId)]
+  /** devices the Gateway paired (or may have paired) in this run that end up unused: the person is told to remove them */
+  /** @type {Array<{ deviceId: string, why: string }>} */
+  const unused = []
   /**
    * @param {string[]} scopes @param {number[]} [protocols]
    * @returns {Promise<{ identity: import('./openclaw-client.js').Identity, deviceToken: string, scopes: string[], protocol: number, version: string }>}
    */
   const pairOne = async (scopes, protocols) => {
     const identity = newIdentity()
-    const client = new GatewayClient({ url, identity, token: /** @type {string} */ (info.token), scopes, protocols, WebSocketImpl: o.WebSocketImpl })
+    const client = new GatewayClient({ url, identity, token: /** @type {string} */ (info.token), scopes, protocols, WebSocketImpl: o.WebSocketImpl, ...(o.connectTimeoutMs ? { connectTimeoutMs: o.connectTimeoutMs } : {}) })
     try {
       const hello = await client.connect()
       const a = hello && hello.auth
-      if (!a || typeof a.deviceToken !== 'string') throw Object.assign(new Error('the Gateway did not issue a device token'), { code: 'NO_TOKEN' })
+      if (!a || typeof a.deviceToken !== 'string') throw Object.assign(new Error('the Gateway did not issue a device token'), { code: 'NO_TOKEN', deviceId: identity.deviceId })
       return { identity, deviceToken: a.deviceToken, scopes: Array.isArray(a.scopes) ? scopeList(a.scopes) : scopes, protocol: client.protocol, version: String(hello.server && hello.server.version || '?') }
+    } catch (e) {
+      // a timeout or a close after the challenge may come after the Gateway already paired this device
+      if (e && typeof e === 'object' && !(/** @type {any} */ (e).deviceId)) /** @type {any} */ (e).deviceId = identity.deviceId
+      throw e
     } finally { client.close() }
   }
+  const hintOf = (/** @type {any} */ err) => (err.code === 'PAIRING_REQUIRED' ? ' (a remote Gateway needs `openclaw devices approve <requestId>`)'
+    : err.code === 'AUTH_TOKEN_MISMATCH' ? ' (wrong Gateway token)' : '')
   /** @type {Awaited<ReturnType<typeof pairOne>>} */
   let approver
   /** @type {Awaited<ReturnType<typeof pairOne>> | null} */
   let writer = null
   try {
     approver = await pairOne(APPROVER_SCOPES)
-    if (!approver.scopes.includes('operator.approvals')) {
-      steps.push({ step: 'pairing', ok: false, message: 'the Gateway did not grant operator.approvals: approval prompts cannot reach the glasses' })
-      return { ok: false, steps }
-    }
-    steps.push({ step: 'pairing', ok: true, message: `approvals device ${approver.identity.deviceId.slice(0, 12)}... paired (${approver.scopes.join(', ')}; protocol ${approver.protocol}, OpenClaw ${approver.version})` })
-    const w = await pairOne(WRITER_SCOPES, [approver.protocol])
-    if (w.scopes.includes('operator.approvals')) {
-      steps.push({ step: 'instructions', ok: true, message: 'the Gateway gave the instructions device operator.approvals as well, so it is NOT used: instructions from the glasses are off for OpenClaw' })
-    } else if (!w.scopes.includes('operator.write')) {
-      steps.push({ step: 'instructions', ok: true, message: 'without operator.write the glasses cannot send instructions to OpenClaw sessions' })
-    } else {
-      writer = w
-      steps.push({ step: 'pairing', ok: true, message: `instructions device ${w.identity.deviceId.slice(0, 12)}... paired (${w.scopes.join(', ')}; no operator.approvals, so a message can never approve anything)` })
-    }
   } catch (e) {
     const err = /** @type {any} */ (e)
-    const hint = err.code === 'PAIRING_REQUIRED' ? ' (a remote Gateway needs `openclaw devices approve <requestId>`)'
-      : err.code === 'AUTH_TOKEN_MISMATCH' ? ' (wrong Gateway token)' : ''
-    steps.push({ step: 'pairing', ok: false, message: `${err.message}${hint}; is the Gateway running? (openclaw gateway)` })
+    if (err.code === 'TIMEOUT' || err.code === 'NO_TOKEN') unused.push({ deviceId: err.deviceId, why: 'approvals device of an unfinished pairing (it may not be listed)' })
+    noteOrphans(unused, steps)
+    steps.push({ step: 'pairing', ok: false, message: `${err.message}${hintOf(err)}; is the Gateway running? (openclaw gateway)` })
     return { ok: false, steps }
+  }
+  if (!approver.scopes.includes('operator.approvals')) {
+    unused.push({ deviceId: approver.identity.deviceId, why: 'approvals device without operator.approvals' })
+    noteOrphans(unused, steps)
+    steps.push({ step: 'pairing', ok: false, message: 'the Gateway did not grant operator.approvals: approval prompts cannot reach the glasses' })
+    return { ok: false, steps }
+  }
+  steps.push({ step: 'pairing', ok: true, message: `approvals device ${approver.identity.deviceId.slice(0, 12)}... paired (${approver.scopes.join(', ')}; protocol ${approver.protocol}, OpenClaw ${approver.version})` })
+  // the second pairing: a Gateway that has just started may not answer a second connection for some seconds (review 3,
+  // P5), so up to three tries; if it still fails, the approvals device is KEPT (approvals work, instructions are off)
+  /** @type {any} */
+  let lastErr = null
+  for (let attempt = 0; attempt < 3 && !writer; attempt++) {
+    if (attempt) await new Promise((r) => setTimeout(r, o.retryMs ?? 3000))
+    try {
+      const w = await pairOne(WRITER_SCOPES, [approver.protocol])
+      lastErr = null
+      if (w.scopes.includes('operator.approvals')) {
+        unused.push({ deviceId: w.identity.deviceId, why: 'instructions device that was given operator.approvals' })
+        steps.push({ step: 'instructions', ok: true, message: 'the Gateway gave the instructions device operator.approvals as well, so it is NOT used: instructions from the glasses are off for OpenClaw' })
+      } else if (!w.scopes.includes('operator.write')) {
+        unused.push({ deviceId: w.identity.deviceId, why: 'instructions device without operator.write' })
+        steps.push({ step: 'instructions', ok: true, message: 'without operator.write the glasses cannot send instructions to OpenClaw sessions' })
+      } else {
+        writer = w
+        steps.push({ step: 'pairing', ok: true, message: `instructions device ${w.identity.deviceId.slice(0, 12)}... paired (${w.scopes.join(', ')}; no operator.approvals, so a message can never approve anything)` })
+      }
+      break
+    } catch (e) {
+      lastErr = e
+      if (lastErr.code === 'TIMEOUT' || lastErr.code === 'NO_TOKEN') unused.push({ deviceId: lastErr.deviceId, why: 'instructions device of an unfinished pairing (it may not be listed)' })
+      if (lastErr.code === 'AUTH_TOKEN_MISMATCH' || lastErr.code === 'PAIRING_REQUIRED') break
+    }
+  }
+  if (lastErr) {
+    steps.push({ step: 'instructions', ok: false, message: `the instructions device could not be paired (${lastErr.message}${hintOf(lastErr)}): approvals work, messages from the glasses are off for OpenClaw; run install openclaw again to add it` })
   }
   saveIdentity(approverFile(), approver.identity)
   if (writer) saveIdentity(writerFile(), writer.identity)
@@ -255,17 +287,45 @@ export async function install(o = {}) {
   for (const f of [legacyIdentityFile(), legacyTokenFile()]) { try { fs.unlinkSync(f) } catch { /* none */ } }
   steps.push({ step: 'token', ok: true, message: `device tokens stored in ${tokensFile()} (readable by you only; they never leave this computer)` })
   const now = new Set([approver.identity.deviceId, writer?.identity.deviceId])
-  for (const old of before.filter((x) => !now.has(x))) {
+  // earlier pairings and unused devices of earlier runs are told once more here, then forgotten; this run's unused ones
+  // are kept for doctor until the next install or uninstall
+  for (const old of [...new Set(before)].filter((x) => !now.has(x))) {
     steps.push({ step: 'old device', ok: true, message: `an earlier pairing of this bridge is no longer used; revoke it: openclaw devices remove ${old}` })
   }
+  try { fs.unlinkSync(orphansFile()) } catch { /* none */ }
+  noteOrphans(unused, steps)
   for (const f of askFallbackFull()) steps.push({ step: 'WARNING', ok: true, message: `${f} has askFallback: full - OpenClaw then allows by itself when nobody answers in time. Set it to deny (OpenClaw's default) to keep "no answer = no".` })
   steps.push({ step: 'config', ok: true, message: 'nothing in your OpenClaw configuration was changed; the bridge connects only while away mode is on' })
   return { ok: true, steps }
 }
 
+/** Devices an unfinished or partly refused pairing left in the Gateway, with nobody holding their key (review 3, P5). */
+export const orphansFile = () => path.join(dir(), 'orphans.json')
+
+/** @returns {Array<{ deviceId: string, why: string, at: number }>} */
+export function readOrphans() {
+  const j = /** @type {any} */ (readJson(orphansFile()))
+  const list = j && Array.isArray(j.devices) ? j.devices : []
+  return list.filter((/** @type {any} */ x) => x && typeof x.deviceId === 'string' && /^[0-9a-f]{16,128}$/i.test(x.deviceId))
+}
+
+/**
+ * Remember devices that ended up unused (doctor and uninstall name them) and tell the person how to remove them.
+ * @param {Array<{ deviceId: string, why: string }>} list @param {Array<{ step: string, ok: boolean, message: string }>} steps
+ */
+function noteOrphans(list, steps) {
+  const fresh = list.filter((x) => x && typeof x.deviceId === 'string' && x.deviceId)
+  if (!fresh.length) return
+  const known = readOrphans()
+  const ids = new Set(known.map((x) => x.deviceId))
+  const devices = [...known, ...fresh.filter((x) => !ids.has(x.deviceId)).map((x) => ({ deviceId: x.deviceId, why: x.why, at: Date.now() }))]
+  try { fs.mkdirSync(dir(), { recursive: true }); writeJson(orphansFile(), { v: 1, devices }) } catch { /* reported below anyway */ }
+  for (const x of fresh) steps.push({ step: 'unused device', ok: true, message: `${x.why}: nobody holds its key; remove it from the Gateway: openclaw devices remove ${x.deviceId}` })
+}
+
 /** @returns {{ ok: boolean, steps: Array<{ step: string, ok: boolean, message: string }> }} */
 export function uninstall() {
-  const ids = previousDevices()
+  const ids = [...new Set([...previousDevices(), ...readOrphans().map((x) => x.deviceId)])]
   if (!fs.existsSync(dir())) return { ok: true, steps: [{ step: 'openclaw', ok: true, message: 'nothing to remove' }] }
   fs.rmSync(dir(), { recursive: true, force: true })
   const steps = [{ step: 'files', ok: true, message: `removed ${dir()} (device keys and tokens)` }]
@@ -277,12 +337,15 @@ export function uninstall() {
 export async function doctor() {
   /** @type {Array<{ ok: boolean | null, text: string, hint?: string }>} */
   const out = []
+  // devices an unfinished pairing left in the Gateway (review 3, P5): harmless (nobody has their key), but listed
+  const orphans = readOrphans().map((x) => ({ ok: null, text: `OpenClaw: device ${x.deviceId.slice(0, 12)}... (${x.why}) may still be listed in the Gateway`, hint: `openclaw devices remove ${x.deviceId}` }))
   const inst = installed()
   if (!inst.installed) {
     return [inst.legacy
       ? { ok: false, text: 'OpenClaw: paired by an older version with ONE token that can both approve and send messages; it is not used any more', hint: 'npx hinty-agents install openclaw' }
-      : { ok: null, text: 'OpenClaw: bridge not paired with the Gateway', hint: 'npx hinty-agents install openclaw' }]
+      : { ok: null, text: 'OpenClaw: bridge not paired with the Gateway', hint: 'npx hinty-agents install openclaw' }, ...orphans]
   }
+  out.push(...orphans)
   const p = /** @type {NonNullable<ReturnType<typeof readPairing>>} */ (readPairing())
   for (const [name, part, scopes] of /** @type {const} */ ([['approvals', p.approver, APPROVER_SCOPES], ['instructions', p.writer, WRITER_SCOPES]])) {
     if (!part) { out.push({ ok: null, text: 'OpenClaw instructions device: not paired (messages from the glasses are off for OpenClaw)', hint: 'npx hinty-agents install openclaw' }); continue }
@@ -317,19 +380,74 @@ export const decisionFor = (d) => (d === 'allow' ? 'allow-once' : 'deny')
  */
 export const CHAT_PREAMBLE = 'Message from the user, sent from Hinty (glasses or web panel):'
 
-/** OpenClaw drops everything before this marker (case-sensitive) before it looks for a command */
-const CURRENT_MARKER = /current message - respond to this/gi
+const ZWSP = '\u200b'
+/** characters OpenClaw could drop before it looks at the text (it already does for mentions): no layer may rely on them */
+const INVISIBLE = /[\p{Default_Ignorable_Code_Point}\p{Cf}]/gu
+/**
+ * OpenClaw drops everything before `[Current message - respond to this]` (case-sensitive) before it looks for a
+ * command. Here matched loosely (any case, any white space, any dash) and broken with a VISIBLE character: its dash
+ * becomes an en dash, so no later normalisation (zero-width characters dropped, white space folded) can bring it back
+ * (security review 3, P2b).
+ */
+const CURRENT_MARKER = /current\s+message\s*[\p{Pd}\u2212\ufe63\uff0d]\s*respond\s+to\s+this/giu
+const DASHES = /[\p{Pd}\u2212\ufe63\uff0d]/gu
+const EN_DASH = '\u2013'
+/** a command could start here in what OpenClaw sees: at the start, or after white space (not `//` of a URL) */
+const COMMAND_START = /(?:^|\s)(?:\/(?!\/)|!)/u
 
 /**
- * Text for chat.send: plain message (safeInstruction), and a zero-width space before every `/` or `!` that OpenClaw's
- * clean-up could bring to the start of the message or after white space: after the start, white space, `]` (end of a
- * removed `[...]`), `:` (end of a removed `label:`, but not `://` of a URL) or a written out `\n`. OpenClaw's "current
- * message" marker is broken up. Idempotent enough: a zero-width space is never doubled before the same character.
+ * OpenClaw 2026.3.28 `stripStructuralPrefixes` (dist/reply-history-*.js), copied byte for byte: what OpenClaw runs on
+ * a message before it looks for `/approve`, `/new`, `/stop`, `!` ... (test/openclaw-strip.test.js keeps its own copy and
+ * checks both agree). Used to verify every message before it is sent.
  * @param {string} text
  */
-export const disarm = (text) => safeInstruction(text)
-  .replace(CURRENT_MARKER, (m) => `${m[0]}​${m.slice(1)}`)
-  .replace(/(^|\s|\]|\\n)([/!])|(:)(?!\/\/)([/!])/gu, (_m, a, b, c, d) => (a !== undefined ? `${a}​${b}` : `${c}​${d}`))
+export function openclawStrip(text) {
+  if (!text) return ''
+  return (text.includes('[Current message - respond to this]') ? text.slice(text.indexOf('[Current message - respond to this]') + 35).trimStart() : text).replace(/\[[^\]]+\]\s*/g, '').replace(/^[ \t]*[A-Za-z0-9+()\-_. ]+:\s*/gm, '').replace(/\\n/g, ' ').replace(/\s+/g, ' ').trim()
+}
+
+/** @param {string} c a character @param {RegExp} re does it become one of these under compatibility normalisation? */
+const becomes = (c, re) => re.test(c.normalize('NFKC'))
+const SLASHY = /[/!]/
+const BRACKETY = /[[\]]/
+
+/**
+ * Is a chat.send message safe as OpenClaw sees it (security review 3, P2a)? After OpenClaw's own clean-up the fixed
+ * first line is still at the start and no command can start after it; and the first line also survives when the
+ * zero-width characters are dropped first or the text is NFKC-normalised (so the fixed line never depends on them).
+ * @param {string} message @returns {boolean}
+ */
+export function seenAsText(message) {
+  const head = openclawStrip(CHAT_PREAMBLE)
+  const seen = openclawStrip(message)
+  if (!seen.startsWith(head) || COMMAND_START.test(seen.slice(head.length))) return false
+  const bare = message.replace(INVISIBLE, '')
+  for (const v of [bare, bare.normalize('NFKC'), message.normalize('NFKC')]) if (!openclawStrip(v).startsWith(head)) return false
+  return !COMMAND_START.test(openclawStrip(message.normalize('NFKC')).slice(head.length))
+}
+
+/**
+ * Text for chat.send: plain message (safeInstruction, invisible characters dropped), OpenClaw's "current message" marker
+ * broken with a visible character, and a zero-width space before every `/` or `!` that OpenClaw's clean-up could bring
+ * to the start of the message or after white space: after the start, white space, `]` (end of a removed `[...]`), `:`
+ * (end of a removed `label:`, but not `://` of a URL) or a written out `\n`. Then the result is checked the way OpenClaw
+ * will see it (`seenAsText`, with a copy of its clean-up); if a command start could still appear (a text built for
+ * the order of OpenClaw's steps, like `\[x]n/approve`), EVERY `/` and `!` gets a zero-width space, and if the fixed
+ * line could still be cut, every bracket becomes a parenthesis. Ordinary text, paths and URLs come out unchanged.
+ * @param {string} text
+ */
+export function disarm(text) {
+  let t = safeInstruction(String(text ?? '').replace(INVISIBLE, '').replace(/\r\n?/g, '\n'))
+  t = t.replace(CURRENT_MARKER, (m) => m.replace(DASHES, EN_DASH))
+  t = t.replace(/(^|\s|\]|\\n)([/!])|(:)(?!\/\/)([/!])/gu, (_m, a, b, c, d) => (a !== undefined ? `${a}${ZWSP}${b}` : `${c}${ZWSP}${d}`))
+  if (seenAsText(`${CHAT_PREAMBLE}\n${t}`)) return t
+  // every / and ! (and what NFKC turns into them) behind a zero-width space
+  t = Array.from(t).map((c, i, a) => (becomes(c, SLASHY) && a[i - 1] !== ZWSP ? ZWSP + c : c)).join('')
+  if (seenAsText(`${CHAT_PREAMBLE}\n${t}`)) return t
+  // the fixed line could still be cut: no bracket left, so no marker and no `[...]` removal
+  t = Array.from(t).map((c) => (becomes(c, BRACKETY) ? (c.normalize('NFKC').includes('[') ? '(' : ')') : c)).join('')
+  return t
+}
 
 /** The whole chat.send message: the fixed first line, then the disarmed text. @param {string} text */
 export const chatMessage = (text) => `${CHAT_PREAMBLE}\n${disarm(text)}`

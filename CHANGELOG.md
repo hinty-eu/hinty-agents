@@ -1,5 +1,35 @@
 # Changelog
 
+## 0.3.1
+
+Security fixes after the third review.
+
+- Cards: characters without a glyph are found by Unicode property, not a list (every default-ignorable, format,
+  private-use and unassigned character, so also soft hyphens, variation selectors and tag characters), and a line with
+  nothing visible on it (white space, combining marks, blank symbols such as U+1D159, U+16FE4 or U+FFFC) counts as
+  empty. Any such removal or folding makes the card incomplete (deny only from the glasses). An emoji keeps its
+  variation selector or joiner on the card, but the card is incomplete too; emoji without them, accents, Polish and
+  other scripts change nothing.
+- OpenClaw: the "current message" marker is broken with a visible character, and every message is checked with a copy
+  of OpenClaw's clean-up before it is sent (a text built for the order of its steps gets every `/` and `!` neutralised),
+  so the three layers no longer depend on each other. If the second pairing fails, the approvals device is kept
+  (instructions stay off) instead of being left in the Gateway without a key; devices left over are named with
+  `openclaw devices remove <id>` in install, `doctor` and uninstall.
+- Codex and Grok hooks: Node.js is written with forward slashes (`C:/PROGRA~1/nodejs/node.exe` starts in `cmd.exe`,
+  PowerShell and `sh`); `install` and `doctor` run the installed command with `--ping` (nothing read, nothing sent) in
+  those shells and report where it does not start (for Grok with `--ask-shell` that would mean no veto).
+- Hooks: a signature header with bytes outside ASCII no longer ends a hook with an exception; any error in a callback
+  ends the hook quietly (no output, exit 0).
+- Hermes: redaction markers of other spellings (`<redacted>`, `[hidden]`, `•••`, written-out `\u200b` ...) make the
+  card incomplete too.
+- `uninstall --all --purge` deletes only what hinty-agents created; the folder itself only when it carries the
+  `.hinty-agents-home` marker and nothing else is left; a `HINTY_AGENTS_HOME` that is a home folder, a drive or a system
+  folder is never emptied (nor has its access narrowed: `doctor` reports such a folder). From `app/` only version
+  folders with our `package.json` are removed.
+- `app/<version>` is used only while it matches the manifest (size and SHA-256 of every file) written when it was
+  copied; otherwise it is copied again, and the service refuses to start from a copy that does not match.
+- `hinty-agents daemon` exits with code 1 when it refuses to start.
+
 ## 0.3.0
 
 - Security fixes after the second review: OpenClaw instructions go over a separate Gateway device without approval

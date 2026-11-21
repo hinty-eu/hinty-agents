@@ -16,6 +16,8 @@ const REPO = fileURLToPath(new URL('../', import.meta.url))
 const CLI = path.join(REPO, 'bin', 'hinty-agents.js')
 const VERSION = JSON.parse(fs.readFileSync(path.join(REPO, 'package.json'), 'utf8')).version
 const tmp = () => fs.mkdtempSync(path.join(os.tmpdir(), 'hinty-app-'))
+/** what app/ holds besides the manifests folder */
+const versions = (dir) => fs.readdirSync(dir).filter((n) => n !== '.manifests')
 
 /** run a body with HINTY_AGENTS_HOME / HINTY_AGENTS_DEV set; the active root goes back afterwards */
 function withHome(home, dev, body) {
@@ -42,7 +44,8 @@ test('ensureApp copies the package and its dependencies to app/<version> and swi
     }
     assert.equal(fs.existsSync(path.join(target, 'test')), false, 'no tests in the copy')
     assert.equal(fs.existsSync(path.join(target, '.git')), false)
-    assert.deepEqual(fs.readdirSync(path.join(home, 'app')), [VERSION], 'no temporary folder left')
+    assert.deepEqual(versions(path.join(home, 'app')), [VERSION], 'no temporary folder left')
+    assert.equal(fs.existsSync(path.join(home, 'app', '.manifests', `${VERSION}.json`)), true, 'manifest written')
     // the copy runs on its own: Node resolves socket.io-client from the copy's node_modules
     const v = spawnSync(process.execPath, [cliEntry(), '--version'], { encoding: 'utf8', env: { ...process.env, HINTY_AGENTS_HOME: home } })
     assert.equal(v.stdout.trim(), VERSION, v.stderr)
@@ -94,7 +97,7 @@ test('a broken copy (no dependencies) is replaced atomically, not trusted', () =
     const r = ensureApp()
     assert.equal(r.copied, true)
     assert.equal(fs.existsSync(path.join(target, 'node_modules', 'socket.io-client', 'package.json')), true)
-    assert.deepEqual(fs.readdirSync(path.join(home, 'app')), [VERSION], 'the half copy is gone too')
+    assert.deepEqual(versions(path.join(home, 'app')), [VERSION], 'the half copy is gone too')
   })
 })
 
@@ -103,7 +106,7 @@ test('old versions are removed after the switch: the current and the newest othe
   withHome(home, '0', () => {
     for (const v of ['0.1.0', '0.2.0', '0.2.5', '.tmp-123-x']) fs.mkdirSync(path.join(home, 'app', v), { recursive: true })
     const r = ensureApp()
-    assert.deepEqual(fs.readdirSync(appBase()).sort(), ['0.2.5', VERSION].sort())
+    assert.deepEqual(versions(appBase()).sort(), ['0.2.5', VERSION].sort())
     assert.deepEqual(r.removed.sort(), ['.tmp-123-x', '0.1.0', '0.2.0'].sort())
     assert.deepEqual(pruneOld(VERSION), [], 'nothing more to remove')
   })

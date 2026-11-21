@@ -12,7 +12,7 @@
 import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
-import { checkCommandNode, hooksDir, installScripts, nodeCommand, q } from './hookfiles.js'
+import { checkCommandNode, cmdOnlyNode, hooksDir, installScripts, nodeCommand, probeHook, q } from './hookfiles.js'
 import { isAbsPath, parseShim, runSync, start } from '../exec.js'
 
 export const id = 'codex'
@@ -210,9 +210,13 @@ export function install() {
   fs.writeFileSync(r.file, JSON.stringify(merge(r.cfg), null, 2) + '\n')
   steps.push({ step: 'hooks.json', ok: true, message: `${EVENTS.length} hooks added to ${r.file}` })
   steps.push({ step: 'node', ok: true, message: `the hooks start Node.js by its full path (${nodeCommand()}); if you remove or move this Node.js, run install codex again (doctor checks it)` })
+  if (cmdOnlyNode()) steps.push({ step: 'WARNING', ok: true, message: 'Node.js is in a folder with spaces and this drive has no short (8.3) names: the hook command starts in cmd.exe only, not in PowerShell or sh. If Codex uses another shell, install Node.js in a folder without spaces and run install codex again.' })
+  // the command really starts (review 3, P3): the hook answers --ping without reading anything or calling the service
+  const probe = probeHook(commandFor('SessionStart'), 'codex')
+  steps.push({ step: 'check', ok: probe.ok !== false, message: probe.text })
   for (const n of configNotes()) steps.push({ step: 'note', ok: true, message: n })
   steps.push({ step: 'trust', ok: true, message: 'Codex does not run new hooks until you trust them: at its next start it shows "Hooks need review", choose "Trust all and continue" (or review them later with /hooks)' })
-  return { ok: true, steps }
+  return { ok: probe.ok !== false, steps }
 }
 
 /** @returns {{ ok: boolean, steps: Array<{ step: string, ok: boolean, message: string }> }} */
@@ -241,13 +245,16 @@ export function uninstall() {
 
 /**
  * @returns {{ installed: boolean, complete: boolean, events: string[], file: string, error: string | null,
- *   node: { ok: boolean, node: string, byName: boolean } | null }} node: the Node.js our entries start (doctor checks it)
+ *   node: { ok: boolean, node: string, byName: boolean } | null, command: string | null }} node: the Node.js our entries start
+ *   (doctor checks it); command: one of our hook commands (doctor runs it with --ping)
  */
 export function installed() {
   const r = readHooks()
   const events = []
   /** @type {{ ok: boolean, node: string, byName: boolean } | null} */
   let node = null
+  /** @type {string | null} */
+  let command = null
   if (r.cfg && r.cfg.hooks && typeof r.cfg.hooks === 'object') {
     for (const [ev] of EVENTS) {
       const groups = Array.isArray(r.cfg.hooks[ev]) ? r.cfg.hooks[ev] : []
@@ -257,11 +264,12 @@ export function installed() {
           if (!events.includes(ev)) events.push(ev)
           const n = checkCommandNode(h.command)
           if (!node || (node.ok && !n.ok)) node = n
+          if (!command) command = h.command
         }
       }
     }
   }
-  return { installed: events.length > 0, complete: events.length === EVENTS.length, events, file: r.file, error: r.error, node }
+  return { installed: events.length > 0, complete: events.length === EVENTS.length, events, file: r.file, error: r.error, node, command }
 }
 
 /**

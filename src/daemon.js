@@ -3,6 +3,7 @@
 // Started by `hinty-agents start` (or the wizard, or the SessionStart hook after a reboot); stopped by `hinty-agents stop`.
 import fs from 'node:fs'
 import path from 'node:path'
+import { checkRunningCopy } from './app.js'
 import { newSecret } from './crypto.js'
 import { pingOwn } from './client.js'
 import { hardenEnv } from './exec.js'
@@ -117,6 +118,15 @@ export async function runDaemon() {
   const log = createLog(p.log)
   // the folder's access was narrowed and read back by ensureHome(); a failure is kept for `doctor` and logged (Z7)
   if (!homeAccess().ok) log('home_access', { ok: false, problem: homeAccess().problem.slice(0, 80) })
+  // started from the program copy (by `start`, or by a hook after a reboot): it must still match the manifest written
+  // when it was made; a quick check (files and sizes). Otherwise no service, so every hook stays empty (review 3, 6b; N1)
+  const copy = checkRunningCopy({ quick: true })
+  if (!copy.ok) {
+    log('app_copy_mismatch', { why: copy.why.slice(0, 80) })
+    console.error(`hinty-agents: the program copy does not match its manifest (${copy.why}); the service does not start. Copy it again: npx hinty-agents@latest start`)
+    process.exitCode = 1
+    return
+  }
   const config = readConfig()
   if (!isPaired(config) || !config) {
     log('not_paired')

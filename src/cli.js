@@ -3,16 +3,18 @@
 import { spawn, spawnSync } from 'node:child_process'
 import fs from 'node:fs'
 import os from 'node:os'
+import path from 'node:path'
 import readline from 'node:readline'
 import { call, pingOwn, status as daemonStatus } from './client.js'
 import * as claude from './adapters/claude.js'
 import { ADAPTERS, get as getAdapter } from './adapters/index.js'
+import { probeHook } from './adapters/hookfiles.js'
 import { childEnv, hardenEnv, isOurDaemonLine, processCommandLine, sysExe } from './exec.js'
 import { hhmm } from './notify.js'
 import { CHECK_TRIES, checkMatches, prettyCode, pair } from './pair.js'
 import { Relay } from './relay.js'
-import { appBase, ensureApp } from './app.js'
-import { DEFAULT_API, cliEntry, ensureHome, homeAccess, homeDir, isPaired, paths, pidAlive, readConfig, readDaemonAny, readDaemonInfo, updateConfig } from './store.js'
+import { appBase, ensureApp, removeProgramCopies, verifyCopy } from './app.js'
+import { DEFAULT_API, cliEntry, ensureHome, homeAccess, homeDir, isPaired, paths, pidAlive, protectedFolder, purgeBlocker, purgeHome, readConfig, readDaemonAny, readDaemonInfo, readJson, updateConfig } from './store.js'
 import { oneLine } from './text.js'
 import { MODELS } from './stt/models.js'
 import { fmtMB, installVoice, removeVoice, voiceStatus } from './stt/install.js'
@@ -78,7 +80,8 @@ async function dispatch(cmd, rest, argv) {
     case 'daemon': {
       const { runDaemon } = await import('./daemon.js')
       await runDaemon()
-      return 0
+      // a service that refused to start (not paired, changed program copy) set the exit code itself
+      return Number(process.exitCode) || 0
     }
     case 'status': return showStatus()
     case 'away': return away(rest[0])
@@ -625,17 +628,33 @@ async function uninstallAll(flags) {
   if (isPaired(readConfig())) await unpair()
   await stop()
   const home = homeDir()
+  // only a folder that is ours is ever emptied (review 3, 6a): it carries our marker and is not a drive, your home
+  // folder, a system folder or one of their parents; even then only the entries this program creates are removed
+  const blocker = purgeBlocker(home)
   let wipe = flags.includes('--purge')
   if (!wipe && !flags.includes('--keep-data')) {
-    if (interactive()) wipe = await askYes(`Delete your Hinty Agents data folder ${home} (settings, logs, voice models)? [y/N] `)
+    if (interactive()) wipe = await askYes(blocker
+      ? `Delete what Hinty Agents created in ${home} (settings, logs, voice models; the folder itself stays)? [y/N] `
+      : `Delete your Hinty Agents data folder ${home} (settings, logs, voice models)? [y/N] `)
     else out(`The data folder ${home} is kept (no terminal to ask; --purge deletes it).`)
   }
-  // the program copy last: this process may be running from it
-  const target = wipe ? home : appBase()
-  let gone = false
-  try { fs.rmSync(target, { recursive: true, force: true }); gone = !fs.existsSync(target) } catch { /* reported below */ }
-  if (gone) out(`${c.ok('✓')} Removed ${target}`)
-  else { bad++; out(c.bad(`✗ Could not remove ${target} (a file is in use?). Delete it by hand.`)) }
+  // the program copies first (only version folders with our package.json), the rest of the data folder last
+  const copies = removeProgramCopies()
+  if (copies.removed.length) out(`${c.ok('✓')} Removed the program copy: ${appBase()} (${copies.removed.join(', ')})`)
+  if (copies.failed.length) { bad++; out(c.bad(`✗ Could not remove ${copies.failed.map((n) => `${appBase()}/${n}`).join(', ')} (a file is in use?). Delete it by hand.`)) }
+  if (copies.kept.length) out(c.warn(`! Left in ${appBase()} (not made by hinty-agents): ${copies.kept.join(', ')}`))
+  if (wipe) {
+    if (protectedFolder(home)) {
+      bad++
+      out(c.bad(`✗ The data folder ${home} is not emptied: ${blocker}. Delete the hinty-agents files in it by hand (config.json, daemon.*, hooks, openclaw, hermes, models, voice).`))
+    } else {
+      const r = purgeHome()
+      if (r.failed.length) { bad++; out(c.bad(`✗ Could not remove ${r.failed.map((n) => path.join(home, n)).join(', ')} (a file is in use?). Delete it by hand.`)) }
+      if (r.folderGone) out(`${c.ok('✓')} Removed ${home}`)
+      else if (r.removed.length || !r.left.length) out(`${c.ok('✓')} Removed what hinty-agents created in ${home}${r.removed.length ? ` (${r.removed.join(', ')})` : ''}`)
+      if (!r.folderGone && r.left.length) out(c.warn(`! The folder ${home} itself stays: ${blocker || 'it holds other things'} (left: ${r.left.slice(0, 6).join(', ')}${r.left.length > 6 ? ', ...' : ''})`))
+    }
+  }
   out(bad ? c.bad(`\n${bad} step(s) need attention.`) : c.ok('\nEverything is removed. (npx keeps its own cache; `npm cache clean --force` empties it.)'))
   return bad ? 1 : 0
 }
@@ -681,6 +700,15 @@ async function doctor() {
     const there = fs.existsSync(cfg.entry)
     const fromCopy = cfg.entry.startsWith(appBase())
     line(there, there ? `Program ${fromCopy ? 'copy' : 'folder'}: ${cfg.entry}` : `The program folder is gone: ${cfg.entry}`, there ? undefined : 'npx hinty-agents@latest start')
+    // the copy is used only while it matches the manifest written when it was made (review 3, 6b): full check here
+    if (there && fromCopy) {
+      const root = path.dirname(path.dirname(cfg.entry))
+      const pkg = readJson(path.join(root, 'package.json'))
+      const ver = String((pkg && pkg.version) || '')
+      const v = verifyCopy(root, ver)
+      line(v.ok, v.ok ? `Program copy ${ver} matches its manifest (every file, sha256)` : `Program copy ${root} does not match its manifest (${oneLine(v.why, 80)}): the service does not start from it`,
+        v.ok ? undefined : `npx hinty-agents@${ver || 'latest'} start (copies it again)`)
+    }
   }
 
   const cc = claude.detect()
@@ -716,6 +744,15 @@ async function doctor() {
       if (n.byName) line(false, `${name} hooks start \`node\` by name (on Windows a node.cmd in the project folder would run instead)`, `npx hinty-agents install ${other}`)
       else line(n.ok, n.ok ? `${name} hooks start Node.js at ${n.node}` : `${name} hooks start a Node.js that is gone: ${n.node}`,
         n.ok ? undefined : `npx hinty-agents install ${other}${other === 'codex' ? ' (Codex then asks you to trust the hooks again)' : ''}`)
+    }
+    // the installed command really starts (review 3, P3): run it with --ping (no content, no call to the service) in
+    // the shells an agent may use; a hook that does not start is silent, and for Grok with --ask-shell = no veto
+    if (inst.installed && inst.command) {
+      const pr = probeHook(inst.command, /** @type {'codex' | 'grok'} */ (other))
+      const all = pr.runs.length > 0 && pr.runs.every((r) => r.ok)
+      const failOpen = pr.ok === false && other === 'grok' && /** @type {any} */ (inst).askShell
+      line(pr.ok === false ? false : all ? true : null, `${name} ${pr.text}${failOpen ? ': Grok RUNS every shell step without a card' : ''}`,
+        pr.ok === false ? `npx hinty-agents install ${other}` : all ? undefined : 'if the agent uses one of the other shells, install Node.js in a folder without spaces and run install again')
     }
   }
   for (const other of ['openclaw', 'hermes']) {

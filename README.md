@@ -73,16 +73,16 @@ supported agents runs as a command; see "Instructions are plain text").
 | No answer means no decision | Service down, away mode off, link lost, refused by the relay, time up (840 s, before the hook's 900 s limit), another protocol version, any error: the hook prints nothing and exits 0, so the agent asks in the terminal as usual. It never approves on its own. |
 | Allow once or deny, nothing else | The hook can print exactly two fixed JSON answers. It never sends `updatedInput` or `updatedPermissions`, so a remote answer can neither change the command nor widen your permission rules. The agent's own `deny` rules still win. |
 | A decision must match | Accepted only while away mode is on, for a request id (128 random bits, single use) this service created, still waiting, not expired, and with the SHA-256 hash of exactly what was asked (`rid`, session, sub-agent, tool, tool input). A replayed or forged decision from anyone else is ignored. |
-| Incomplete cards can only be denied | When the card does not show everything that will run (something was cut, a secret was masked or a value was left visible on purpose, invisible or control characters were removed, blank padding was folded: blank lines of any kind of white space, runs of more than 20 spaces or 8 tabs, Braille or Hangul blanks; a field has a shape the bridge does not know; the agent itself redacted the command (Hermes); environment overrides whose values the agent does not send (OpenClaw)), it is sent with `part: true`. The glasses and the panel offer only *Deny*, and **this service itself refuses a remote *allow*** for it, whatever the relay says. Approve such a request in the terminal. Every cut on a card is marked (`[… cut: 7,000 of 48,211 characters shown]`). |
+| Incomplete cards can only be denied | When the card does not show everything that will run (something was cut, a secret was masked or a value was left visible on purpose, invisible or control characters were removed (decided by Unicode property, not a list: every default-ignorable, format, private-use and unassigned character, so also soft hyphens, variation selectors and tag characters; an emoji with a variation selector or joiner keeps it but makes the card incomplete), blank padding was folded: lines with nothing visible on them (any white space, combining marks, Braille, Hangul and other blank symbols), runs of more than 20 spaces or 8 tabs; a field has a shape the bridge does not know; the agent itself redacted the command (Hermes); environment overrides whose values the agent does not send (OpenClaw)), it is sent with `part: true`. The glasses and the panel offer only *Deny*, and **this service itself refuses a remote *allow*** for it, whatever the relay says. Approve such a request in the terminal. Every cut on a card is marked (`[… cut: 7,000 of 48,211 characters shown]`). |
 | Away mode is opt-in | Off by default and after every restart. While off, nothing about your sessions leaves the computer and the hook answers at once. It turns itself off 12 hours after it was switched on. |
 | Remote switch-on needs your consent | The Hinty panel or the glasses can switch away mode **on** only if you allowed it on this computer (the setup wizard asks once; `npx hinty-agents remote-away on\|off`; default **off**). Without it a remote switch-on is refused and logged. A remote switch-on lasts at most until **12 hours after you last switched away mode on here or gave that consent**: switching it off and on again remotely does not start the 12 hours again, and after them a remote switch-on is refused until you run `away on` or `remote-away on` at this computer. It is always visible here: Claude Code's status line and a toast, a system notification, `npx hinty-agents status`, the log. Switching it **off** remotely always works. |
 | Pairing needs a number from your panel | After the pairing code is typed in the panel, that panel shows a 4-digit number and the terminal asks you to type it (3 tries). Only the account that typed the code sees the number, so a code read off a shared screen and typed into someone else's account does not get past this step: a wrong number, no number or no terminal (piped input) disconnects the computer again and nothing is saved. The terminal also shows the masked account (extra information only). |
 | Secrets are masked | Before any text leaves: `sk-…`, `ghp_…`, `AKIA…`, `Bearer …`, `password=…`, JWTs, private keys, credentials in URLs and similar are replaced with `***` (and the card becomes incomplete). A value that contains shell syntax (`$(`, backticks, `;`, `|`, `&`, `<`, `>`) is never hidden: it may be the part that runs. Best effort, not a guarantee. Every pattern runs in linear time (1 MB of crafted text per pattern in well under 100 ms). |
-| Instructions are plain text | Every instruction is cleaned (no control or invisible characters) and every line that starts with `/ ! # @ $` gets a zero-width space in front, so Claude Code and Codex never read it as a slash command, bash mode or a memory note. OpenClaw cleans a message itself before it looks for commands, so for OpenClaw an instruction additionally goes over a **separate Gateway connection that has no approval rights** (OpenClaw refuses `/approve` from it), starts with a fixed line OpenClaw's clean-up cannot remove, and has `/` and `!` neutralised after `]`, `:` and white space too. Details below. |
+| Instructions are plain text | Every instruction is cleaned (no control or invisible characters) and every line that starts with `/ ! # @ $` gets a zero-width space in front, so Claude Code and Codex never read it as a slash command, bash mode or a memory note. OpenClaw cleans a message itself before it looks for commands, so for OpenClaw an instruction additionally goes over a **separate Gateway connection that has no approval rights** (OpenClaw refuses `/approve` from it), starts with a fixed line OpenClaw's clean-up cannot remove, and has `/` and `!` neutralised after `]`, `:` and white space too; every message is checked with a copy of OpenClaw's clean-up before it is sent. Details below. |
 | Local port | Listens on `127.0.0.1` only, random port. The key in `~/.hinty-agents/daemon.json` (readable by you only) **never travels**: every request from a hook, the mod, the CLI or the Hermes plugin is signed with it (HMAC-SHA256 over a one-time nonce, a timestamp, method, path and the body's SHA-256; 30 s window, a nonce counts once), and every answer is signed over the request's nonce, the status and the body. Before a hook, the mod or the Hermes plugin sends anything with content (a command, a prompt, an answer, a session id) it checks that the process in `daemon.json` is alive and that the port answers a signed ping with that process's id (limit 0.3-1.5 s). So a process that grabbed the port of a crashed service gets no content, cannot answer for the service and cannot make a hook wait. A stale `daemon.json` is removed when the service starts. Requests with an `Origin`, `Sec-Fetch-*` or foreign `Host` header (browsers) are refused. Protocol version 2 (`pv` in `daemon.json`): hooks, mod and service of different versions stay silent (no answer = the agent asks as usual); `doctor` tells you what to update. |
-| No programs from the current folder | On Windows, programs (`claude`, `npm`, `codex`, `openclaw`, `hermes`, `icacls`, `taskkill`, `whoami`) are found by the bridge's own `PATH` lookup or by full path (never the current folder) and started without a shell, with `NoDefaultCurrentDirectoryInExePath=1`. The Codex and Grok hooks start Node.js **by its full path** (Codex runs hook commands with `cmd.exe` in the session's folder, which would otherwise run a `node.cmd` from a cloned repository); after you move or remove that Node.js, `doctor` says so and `install codex|grok` writes the new path. `HINTY_AGENTS_HOME` counts only as an absolute path, and the hooks start the service only from an installed hinty-agents outside the session's project folder. |
+| No programs from the current folder | On Windows, programs (`claude`, `npm`, `codex`, `openclaw`, `hermes`, `icacls`, `taskkill`, `whoami`) are found by the bridge's own `PATH` lookup or by full path (never the current folder) and started without a shell, with `NoDefaultCurrentDirectoryInExePath=1`. The Codex and Grok hooks start Node.js **by its full path** (Codex runs hook commands with `cmd.exe` in the session's folder, which would otherwise run a `node.cmd` from a cloned repository); after you move or remove that Node.js, `doctor` says so and `install codex|grok` writes the new path. `install` and `doctor` also run the installed command (with `--ping`: nothing is read or sent) in `cmd.exe`, PowerShell and `sh` and say where it does not start, so a hook that silently never runs (for Grok with `--ask-shell`: no veto) shows up. `HINTY_AGENTS_HOME` counts only as an absolute path, and the hooks start the service only from an installed hinty-agents outside the session's project folder. |
 | `stop` and the lock check the service | `stop` kills a process only after it answered a signed ping with the pid in `daemon.json`; a lock file held by a process that never answers is taken over after 3 seconds. |
-| Data folder for you only | `~/.hinty-agents` (or `HINTY_AGENTS_HOME`) is narrowed at every start of the CLI and the service, not only when it is created: 0700 on Linux and macOS (`doctor` warns when another user owns it); on Windows the access list is set to your account (by SID) and SYSTEM and read back, and `doctor` warns when anybody else can still open it. |
+| Data folder for you only | `~/.hinty-agents` (or `HINTY_AGENTS_HOME`) is narrowed at every start of the CLI and the service, not only when it is created: 0700 on Linux and macOS (`doctor` warns when another user owns it); on Windows the access list is set to your account (by SID) and SYSTEM and read back, and `doctor` warns when anybody else can still open it. A `HINTY_AGENTS_HOME` that is your home folder, a drive or a system folder (or holds one) is left as it is and `doctor` says so: give hinty-agents a folder of its own. |
 | The relay keeps no content | The Hinty server holds cards and session status in memory only (minutes); the database stores only a hash of this computer's token. Content crosses the server in transit (TLS). |
 
 Logs (`~/.hinty-agents/daemon.log`) hold identifiers and counts only, never commands or answers, one event per line.
@@ -120,19 +120,22 @@ Requirements: Node.js 20+, Claude Code (`claude`) with mods enabled (default sin
 Run it with `npx`. **Pin the version** (the hooks run on your machine, so you decide when to update):
 
 ```bash
-npx hinty-agents@0.3.0
+npx hinty-agents@0.3.1
 ```
 
 Or straight from GitHub (a tag, not a branch):
 
 ```bash
-npx github:hinty-eu/hinty-agents#v0.3.0
+npx github:hinty-eu/hinty-agents#v0.3.1
 ```
 
 **Where it lives.** `npx` runs from npm's cache, which npm may clean at any time. So setup (and `start`, `install`)
 first copies the program, with its one dependency `socket.io-client`, to `~/.hinty-agents/app/<version>/`
 (`HINTY_AGENTS_HOME/app/<version>/` if you set it) and uses only that copy: the service, the Codex / Grok / Hermes hook
 files and the Claude Code plugin marketplace point there. Reading the code you run: `~/.hinty-agents/app/<version>/src`.
+When the copy is made, the size and SHA-256 of every file go to `app/.manifests/<version>.json`; a folder of that
+version is used only while it matches (`start`, `install` and `doctor` check every file, the service at start checks
+files and sizes). A copy that does not match is copied again from the package, and the service refuses to start from it.
 Running another version copies it next to the old one; the previous version is kept, older ones are removed. A git
 checkout (a `.git` folder, or `HINTY_AGENTS_DEV=1`) runs in place, without a copy.
 
@@ -190,7 +193,9 @@ or switches hooks off, install says so.
 **Trust (once).** Codex runs a new hook only after you trust it. At its next start Codex shows *Hooks need review*:
 choose *Trust all and continue* (or review them later with `/hooks`). Until then nothing of Hinty runs in Codex.
 
-The hooks start Node.js by its full path (on Windows its short `C:\PROGRA~1\...` form when the path has spaces). After a
+The hooks start Node.js by its full path, written with forward slashes (on Windows its short `C:/PROGRA~1/...` form when
+the path has spaces; that form starts in `cmd.exe`, PowerShell and `sh` alike). On a drive without short names a path
+with spaces works in `cmd.exe` only: install says so. After a
 Node.js update that moves it, or with a version manager that removes the old version, `doctor` reports it; run
 `npx hinty-agents install codex` again (Codex then asks you to trust the changed hooks once more). A Codex install
 from 0.2.x still starts `node` by name: `doctor` flags it, `install codex` fixes it.
@@ -247,7 +252,10 @@ first connection from the loopback pairs itself; a remote Gateway needs `opencla
 - *instructions* (`operator.read`, `operator.write`, **no** `operator.approvals`): sends your messages with `chat.send`.
   OpenClaw refuses `/approve` (and other approval commands) from a client without `operator.approvals`, however the
   text is dressed up, so a message can never approve anything. If your Gateway gives this device approval rights too,
-  install says so and keeps instructions off.
+  install says so and keeps instructions off. If the second pairing fails (a Gateway that has just started may not
+  answer it for some seconds; install tries three times), the approvals device is kept and instructions stay off until
+  you run install again. A device the Gateway paired but the bridge cannot use is named with the
+  `openclaw devices remove <id>` to run, in install, `doctor` and uninstall.
 
 It reads the Gateway port and token from your `openclaw.json` (or `OPENCLAW_GATEWAY_TOKEN`) for these two connections
 only and does not store the shared token; if the token is a secret reference (`file` / `exec`) give it once with
@@ -294,7 +302,8 @@ afterwards (plugins load once per process).
 - **Approvals.** While away mode is on, each approval prompt (CLI, TUI, Desktop, messengers) is shown on the glasses /
   panel through Hermes's approval transport; Allow = `once`, Deny = `deny`. `session` and `always` are never returned.
   The plugin receives Hermes's display copy of the command, in which Hermes has already hidden secrets (`KEY=***`,
-  `abc...xyz`, `«redacted…»`, `[REDACTED …]`, folded padding `⟨+N …⟩`); a card with any such trace is incomplete, so
+  `abc...xyz`, `«redacted…»`, `[REDACTED …]`, folded padding `⟨+N …⟩`, and, for other Hermes versions, anything that
+  looks like a marker: `<redacted>`, `[hidden]`, `•••`, `███`, written-out `\u200b`); a card with any such trace is incomplete, so
   **prompts that carry a secret are approved at the computer** (also `git diff a...b` or `go test ./...`).
 - **No answer = Hermes asks as usual (N1).** Away mode off, the bridge not running, no answer in time or any error makes
   the plugin raise, and `transport_fallback: builtin` makes Hermes show its normal prompt. **Trade-off:** while away mode
@@ -370,7 +379,10 @@ npx hinty-agents uninstall --all
 
 It removes the hooks and plugins of every agent you installed (Claude Code plugin and marketplace, Codex, Grok, OpenClaw,
 Hermes), unpairs this computer (revokes the token), stops the service, deletes `~/.hinty-agents/app/` and asks whether
-to delete the rest of `~/.hinty-agents` too (`--purge` deletes it without asking, `--keep-data` keeps it). `npx` keeps
+to delete the rest of `~/.hinty-agents` too (`--purge` deletes it without asking, `--keep-data` keeps it). Only what
+hinty-agents created is deleted: the folder itself goes only when it carries the `.hinty-agents-home` marker (written
+when hinty-agents creates the folder or finds it empty) and nothing else is left in it; a `HINTY_AGENTS_HOME` that is
+your home folder, a drive or a system folder is never emptied. `npx` keeps
 its own cache; `npm cache clean --force` empties it.
 
 One at a time:
@@ -395,8 +407,8 @@ Run from a clone (`git clone https://github.com/hinty-eu/hinty-agents`, `npm ins
 Use `HINTY_AGENTS_HOME` and `HINTY_AGENTS_API` to keep a test service away from your real one. Plain JavaScript with
 JSDoc types (no build step); the only dependency is `socket.io-client` (the speech engine and models are installed on
 demand by `voice install`). The mod's types come from Claude Code: once it has loaded the plugin,
-`claude-plugin/.claude-plugin/types/` holds them. `test/review2.test.js` holds one regression test per finding of the
-second security review; with `HERMES_SRC=<hermes-agent checkout>` it also runs Hermes's real redactor.
+`claude-plugin/.claude-plugin/types/` holds them. `test/review2.test.js` and `test/review3.test.js` hold one regression test per finding of the
+second and third security review; with `HERMES_SRC=<hermes-agent checkout>` it also runs Hermes's real redactor.
 
 Known limits:
 - In auto mode Claude Code asks for permission only when its classifier does, so there are fewer cards.

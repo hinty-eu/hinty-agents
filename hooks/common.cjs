@@ -75,7 +75,8 @@ function request(d, method, path, body, timeoutMs, cb) {
       const raw = Buffer.concat(chunks)
       const want = mac('hinty-res\n' + PV + '\n' + nonce + '\n200\n' + sha(raw))
       const got = String(res.headers['x-hinty-sig'] || '')
-      if (got.length !== want.length || !crypto.timingSafeEqual(Buffer.from(got), Buffer.from(want))) return done(null)
+      // 64 lowercase hex characters first: a header with other bytes never reaches timingSafeEqual (review 3, P4)
+      if (!/^[0-9a-f]{64}$/.test(got) || !crypto.timingSafeEqual(Buffer.from(got, 'hex'), Buffer.from(want, 'hex'))) return done(null)
       try { done(JSON.parse(raw.toString('utf8'))) } catch (e) { done(null) }
     })
   })

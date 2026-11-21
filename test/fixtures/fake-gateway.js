@@ -25,6 +25,8 @@ export async function startGateway({ protocol = 3, sharedToken = 'shared-token-A
     port, url: `ws://127.0.0.1:${port}`, sockets, requests: [], connects: [], tokensSeen: [], issued,
     /** how a request is answered: method -> (params) => payload | throws {message, code} */
     handlers: {},
+    /** @type {((n: number, params: any) => 'close' | 'silent' | 'notoken' | undefined) | null} */
+    onConnect: null,
     emit(event, payload) { for (const s of sockets) if (s.authed) s.send(JSON.stringify({ type: 'event', event, payload })) },
     get clients() { return [...sockets].filter((s) => s.authed).length },
     async close() { for (const s of sockets) s.terminate(); await new Promise((r) => wss.close(r)) },
@@ -44,6 +46,10 @@ export async function startGateway({ protocol = 3, sharedToken = 'shared-token-A
         const p = f.params
         gw.connects.push(p)
         gw.tokensSeen.push(p.auth && p.auth.token)
+        // a test may make the n-th connect fail: 'close' (socket dropped), 'silent' (never answered), 'notoken'
+        const act = gw.onConnect ? gw.onConnect(gw.connects.length, p) : undefined
+        if (act === 'close') return ws.terminate()
+        if (act === 'silent') return
         if (p.minProtocol !== protocol || p.maxProtocol !== protocol) {
           return reply(false, { message: 'protocol mismatch', details: { expectedProtocol: protocol } })
         }
@@ -71,7 +77,7 @@ export async function startGateway({ protocol = 3, sharedToken = 'shared-token-A
         ws.authed = true
         ws.scopes = scopes
         ws.deviceId = p.device.id
-        return reply(true, { type: 'hello-ok', protocol, server: { version: 'fake-1', connId: 'c1' }, auth: { deviceToken: token, role: 'operator', scopes, issuedAtMs: Date.now() } })
+        return reply(true, { type: 'hello-ok', protocol, server: { version: 'fake-1', connId: 'c1' }, auth: act === 'notoken' ? { role: 'operator', scopes } : { deviceToken: token, role: 'operator', scopes, issuedAtMs: Date.now() } })
       }
       if (!ws.authed) return reply(false, { message: 'not connected' })
       gw.requests.push({ method: f.method, params: f.params, scopes: ws.scopes, deviceId: ws.deviceId })

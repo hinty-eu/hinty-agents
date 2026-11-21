@@ -7,11 +7,14 @@
 //                      instruction from the glasses and hands it over as {"decision":"block","reason":...}.
 //   SessionStart       registers the session and adds the one-line glasses instruction (the glasses line).
 //   UserPromptSubmit, PostToolUse, SessionEnd  short status reports; never print anything.
+//   --ping             (doctor / install) prints {"hinty":"pong",...} and exits: reads nothing, calls nothing.
 // Prints nothing but the fixed JSON below.
 
-const { CONTEXT, home, readJson, daemonInfo, send, autostart, readStdin } = require('./common.cjs')
+const { PV, CONTEXT, home, readJson, daemonInfo, send, autostart, readStdin } = require('./common.cjs')
 
 const EVENT = process.argv[2] || ''
+// N1: an error in a callback (after main() returned) ends the hook quietly as well, never with a stack trace
+process.on('uncaughtException', () => process.exit(0))
 const ALLOW = '{"hookSpecificOutput":{"hookEventName":"PermissionRequest","decision":{"behavior":"allow"}}}'
 const DENY = '{"hookSpecificOutput":{"hookEventName":"PermissionRequest","decision":{"behavior":"deny","message":"Denied from Hinty glasses"}}}'
 const ROUTES = {
@@ -59,6 +62,7 @@ function withHome(raw) {
 }
 
 function main() {
+  if (EVENT === '--ping') return process.stdout.write(JSON.stringify({ hinty: 'pong', hook: 'codex', pv: PV }))
   if (!ROUTES[EVENT]) return
   const dir = home()
   const raw = withHome(readStdin())

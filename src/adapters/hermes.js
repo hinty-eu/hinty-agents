@@ -248,8 +248,19 @@ const SAFETY_MS = 7000
  * `[redaction-unavailable]`, `⟨+N blank lines⟩` / `⟨+N whitespace chars⟩` / `⟨\uXXXX ×N⟩`. A card with any of them is
  * incomplete (`part`): deny from the glasses, allow only in Hermes's own prompt. `git diff a...b` and `go test ./...`
  * pay the same price.
+ * Security review 3, P5: other Hermes versions may spell their markers differently (`<redacted>`, `(REDACTED)`,
+ * `[hidden]`, `••••`, `███`...), so the pattern is wide on purpose and errs towards `part`: any `redact` / `censor`, three
+ * `*` or `•` or `x`/`X` in a row used as a mask, block characters, guillemets and angle quotes of any kind, a bracketed
+ * word that says something was hidden, masked, omitted, removed, elided, truncated or filtered (or is a secret, key or
+ * token placeholder), and escapes written out as text (`\u200b`, `\x1b`, Hermes's display form of invisible characters).
  */
-export const HERMES_TRACE = /\*\*\*|\.\.\.|…|«\s*redact|\[\s*redact|⟨/i
+export const HERMES_TRACE = new RegExp([
+  String.raw`\*{3}`, '•{2}', '·{3}', String.raw`\.\.\.`, '…', '[█▓▒░■□▪▫]', '[«»‹›⟨⟩〈〉《》]', 'redact', 'censor',
+  String.raw`[\[<({]\s*(?:hidden|masked|mask|omitted|removed|elided|truncated|filtered|sanitized|secret|private|sensitive|key|token|password|value)\b`,
+  String.raw`\b(?:hidden|masked|omitted|removed|elided|truncated|filtered|sanitized)\s*[\]>)}]`,
+  String.raw`(?:^|[=:'"\s])[xX]{6,}(?=$|['"\s;&|])`,
+  String.raw`\\(?:u[0-9a-fA-F]{4}|U[0-9a-fA-F]{8}|x[0-9a-fA-F]{2}|u\{[0-9a-fA-F]+\})`,
+].join('|'), 'i')
 
 /** @param {string} s */
 export const hermesRedacted = (s) => HERMES_TRACE.test(String(s || ''))

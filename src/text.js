@@ -21,9 +21,32 @@ export const TEXT_MAX = 8000
 export const PRE_MAX = 4 * TEXT_MAX
 const GLASSES = '\u{1F453}'
 
-// Characters that change how text looks without being visible text: direction controls (bidi), zero-width characters,
-// word joiner and invisible operators, byte order mark, interlinear annotation.
-const INVISIBLE = /[\u034f\u061c\u17b4\u17b5\u180b-\u180f\u200b-\u200f\u202a-\u202e\u2060-\u2064\u2066-\u206f\ufeff\ufff9-\ufffb]/g
+// Characters that change how text looks without being visible text, decided by Unicode properties, not a list
+// (security review 3, P1): every default-ignorable code point (direction controls, zero-width characters, word joiner,
+// invisible operators, soft hyphen, variation selectors, tag characters, Hangul fillers, U+2065 ...) and every other
+// format character (byte order mark, interlinear annotation, U+1BCA0, musical format controls ...).
+const INVISIBLE = /[\p{Default_Ignorable_Code_Point}\p{Cf}]/gu
+// For permission cards also private use and unassigned code points (no glyph a viewer could rely on). An emoji keeps
+// its variation selector or joiner right after a pictograph (it looks right), but the card is still incomplete.
+const GLYPHLESS = /[\p{Default_Ignorable_Code_Point}\p{Cf}\p{Co}\p{Cn}]/gu
+/** a fast first look: text made only of these ranges (ASCII, Latin, Cyrillic, common punctuation and symbols, kana,
+ * CJK ideographs, Hangul syllables; none of them glyphless, test/p1-glyphless.test.js checks every one) skips the
+ * property scan */
+export const MAYBE_GLYPHLESS = /[^\x00-\x7f\u00a0-\u00ac\u00ae-\u02ff\u0400-\u04ff\u2010-\u2027\u2030-\u205e\u2190-\u2426\u2500-\u27bf\u3000\u3041-\u3096\u3099-\u30ff\u4e00-\u9fff\uac00-\ud7a3]/
+const PICTOGRAPH = /^\p{Extended_Pictographic}$/u
+/**
+ * Is the character before `at` a pictograph, optionally followed by a skin tone modifier (and, for a joiner, by one
+ * variation selector: 🏳\ufe0f\u200d🌈)? @param {string} s @param {number} at @param {boolean} joiner
+ */
+function afterPictograph(s, at, joiner) {
+  const before = (/** @type {number} */ i) => { const c = s.codePointAt(i - 1) ?? 0; return c >= 0xdc00 && c <= 0xdfff && i >= 2 ? i - 2 : i - 1 }
+  let i = before(at)
+  if (i < 0) return false
+  let cp = s.codePointAt(i) ?? 0
+  if (joiner && cp === 0xfe0f) { i = before(i); if (i < 0) return false; cp = s.codePointAt(i) ?? 0 }
+  if (cp >= 0x1f3fb && cp <= 0x1f3ff) { i = before(i); if (i < 0) return false; cp = s.codePointAt(i) ?? 0 }
+  return PICTOGRAPH.test(String.fromCodePoint(cp))
+}
 // C0 controls except tab and newline, DEL, C1 controls
 const CONTROL = /[\x00-\x08\x0b\x0c\x0e-\x1f\x7f-\x9f]/g
 
@@ -40,29 +63,36 @@ export function cutUnits(s, max) {
 }
 
 // Characters that render as blank space (security review 2, Z4): every Unicode White_Space character except the line
-// break, plus the "blank" letters and symbols (Braille blank U+2800, Hangul fillers U+115F U+1160 U+3164 U+FFA0).
-// A run of them can push the part of a command that runs off the first screen of a card.
-const BLANK = '[^\\S\\n]|[\\u2800\\u115f\\u1160\\u3164\\uffa0]'
-/** a line made only of blank characters, at least one of them not a plain space or tab */
-const ODD_BLANK_LINE = new RegExp(`^(?=(?:${BLANK})*?[^ \\t\\n])(?:${BLANK})+$`, 'gmu')
+// break, plus the "blank" letters and symbols (Braille blank U+2800, Hangul fillers U+115F U+1160 U+3164 U+FFA0,
+// musical null notehead U+1D159, Khitan filler U+16FE4) and what draws nothing in the panel's card font in Chrome
+// (a scan of every code point cleanText keeps, testy-e2e/agenci/sec3/blank-scan.cjs: object replacement U+FFFC,
+// Tibetan tsheg U+0F0B U+0F0C, U+1D085, U+1D0DA). A run of them can push the part of a command that runs off the first
+// screen of a card.
+const WIDE_BLANK = '\\u2800\\u115f\\u1160\\u3164\\uffa0\\ufffc\\u0f0b\\u0f0c\\u{1d159}\\u{16fe4}\\u{1d085}\\u{1d0da}'
+const BLANK = `[^\\S\\n]|[${WIDE_BLANK}]`
+/** a line with nothing a person can see: only blank characters and combining marks (which have nothing to sit on),
+ * at least one of them not a plain space or tab (a line of spaces in code is left alone) */
+const NOTHING_LINE = new RegExp(`^(?=[^\\n]*[^ \\t\\n])(?:${BLANK}|\\p{M})+$`, 'gmu')
 /** 3+ empty lines in a row (after the line above) */
 const BLANK_LINES = /\n(?:[ \t]*\n){3,}/g
 /** a run of more than 20 blank characters after visible text, or more than 64 at the start of a line (like Hermes) */
-const MID_RUN = new RegExp(`(?<=[^\\s\\u2800\\u115f\\u1160\\u3164\\uffa0])(?:${BLANK}){21,}`, 'gu')
+const MID_RUN = new RegExp(`(?<=[^\\s${WIDE_BLANK}])(?:${BLANK}){21,}`, 'gu')
 const LEAD_RUN = new RegExp(`^(?:${BLANK}){65,}`, 'gmu')
 /** tabs weigh more (one tab can be 8 columns): 8+ after text, 12+ at the start of a line; each step is `\t *`, so the
  * pattern has one way to match and cannot backtrack for long */
 const MID_TABS = /(?<=\S) *(?:\t *){8,}/g
 const LEAD_TABS = /^ *(?:\t *){12,}/gm
 /** blank characters other than space and tab inside a line of text, in a run of 2+ (single ones are left) */
-const ODD_RUN = /(?:(?![ \t])[^\S\n]|[\u2800\u115f\u1160\u3164\uffa0]){2,}/gu
+const ODD_RUN = new RegExp(`(?:(?![ \\t])[^\\S\\n]|[${WIDE_BLANK}]){2,}`, 'gu')
 
 /**
- * Line breaks normalised, control and invisible characters removed, blank padding folded: a line of only blank
- * characters of any kind becomes empty, at most two empty lines in a row, a run of more than 20 blank characters after
- * text (more than 64 at the start of a line) becomes one space, a run of 2+ unusual blanks (U+00A0, U+3000, U+2800...)
- * one space. `changed` = anything of that happened (a card with it is incomplete); an ordinary indentation, a line of
- * spaces in code or two empty lines change nothing.
+ * Line breaks normalised, control characters removed, every character without a glyph removed (by Unicode property:
+ * default-ignorable, format, private use, unassigned; an emoji keeps its selector or joiner), blank padding folded: a
+ * line with nothing visible (only blank characters and combining marks) becomes empty, at most two empty lines in a row,
+ * a run of more than 20 blank characters after text (more than 64 at the start of a line) becomes one space, a run of
+ * 2+ unusual blanks (U+00A0, U+3000, U+2800...) one space. `changed` = anything of that happened, also a kept emoji
+ * selector (a card with it is incomplete); an ordinary indentation, a line of spaces in code, two empty lines, accents
+ * and emoji without selectors change nothing.
  * @param {string} s @returns {{ text: string, changed: boolean }}
  */
 export function cleanText(s) {
@@ -78,8 +108,13 @@ export function cleanText(s) {
   }
   sub(/[\r\u2028\u2029\u0085]/g, '\n')
   sub(CONTROL, ' ')
-  sub(INVISIBLE, '')
-  sub(ODD_BLANK_LINE, '')
+  if (MAYBE_GLYPHLESS.test(t)) {
+    t = t.replace(GLYPHLESS, (/** @type {string} */ m, /** @type {number} */ at, /** @type {string} */ all) => {
+      changed = true
+      return (m === '\ufe0f' || m === '\u200d') && afterPictograph(all, at, m === '\u200d') ? m : ''
+    })
+  }
+  sub(NOTHING_LINE, '')
   sub(BLANK_LINES, '\n\n\n')
   sub(LEAD_RUN, ' ')
   sub(MID_RUN, ' ')
