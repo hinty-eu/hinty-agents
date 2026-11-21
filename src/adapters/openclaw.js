@@ -12,7 +12,6 @@
 //  N2  the ONLY decisions we ever send are `allow-once` and `deny` (see `decisionFor`);
 //  N12 a `say` text is a plain message: `safeInstruction` plus a zero-width space before every `/` or `!` that follows
 //      white space (OpenClaw runs `/approve <id> allow-always`, `/exec ...`, `! cmd` from chat text, also inline).
-import { spawnSync } from 'node:child_process'
 import crypto from 'node:crypto'
 import fs from 'node:fs'
 import os from 'node:os'
@@ -20,6 +19,7 @@ import path from 'node:path'
 import { homeDir, writeJson, readJson } from '../store.js'
 import { glassesLine, oneLine, safeInstruction } from '../text.js'
 import { GatewayClient, loadIdentity, SCOPES } from './openclaw-client.js'
+import { resolveProgram, runSync } from '../exec.js'
 
 export const id = 'openclaw'
 export const caps = { perm: 'gateway', say: 'chat' }
@@ -31,20 +31,13 @@ export const dir = () => path.join(homeDir(), 'openclaw')
 export const identityFile = () => path.join(dir(), 'device.json')
 export const tokenFile = () => path.join(dir(), 'token.json')
 
-/** HINTY_AGENTS_OPENCLAW = path of the `openclaw` entry (a .mjs/.js is run with node); default `openclaw` from PATH. */
-const bin = () => process.env.HINTY_AGENTS_OPENCLAW || 'openclaw'
-const quoteWin = (/** @type {string} */ p) => (/^[A-Za-z0-9_@%+=:,./\\-]+$/.test(p) ? p : `"${p.replace(/"/g, '\\"')}"`)
-
 /** @returns {{ found: boolean, version: string | null }} */
 export function detect() {
-  const b = bin()
-  const js = /\.(mjs|cjs|js)$/i.test(b)
-  const win = process.platform === 'win32' && !js
-  const r = js
-    ? spawnSync(process.execPath, [b, '--version'], { encoding: 'utf8', timeout: 30000, windowsHide: true, stdio: ['ignore', 'pipe', 'pipe'] })
-    : win
-      ? spawnSync([b, '--version'].map(quoteWin).join(' '), { shell: true, encoding: 'utf8', timeout: 30000, windowsHide: true, stdio: ['ignore', 'pipe', 'pipe'] })
-      : spawnSync(b, ['--version'], { encoding: 'utf8', timeout: 30000, stdio: ['ignore', 'pipe', 'pipe'] })
+  // HINTY_AGENTS_OPENCLAW = an absolute path of the `openclaw` entry; default: `openclaw` by our own PATH lookup
+  // (never the current folder), started without a shell (an npm shim is mapped to node + openclaw.mjs)
+  const launch = resolveProgram('openclaw', process.env.HINTY_AGENTS_OPENCLAW)
+  if (!launch) return { found: false, version: null }
+  const r = runSync(launch, ['--version'], { encoding: 'utf8', timeout: 30000, stdio: ['ignore', 'pipe', 'pipe'] })
   if (r.status !== 0) return { found: false, version: null }
   const m = String(r.stdout || '').match(/(\d{4}\.\d+\.\d+)/)
   return { found: true, version: m ? m[1] : String(r.stdout || '').trim().slice(0, 40) }
@@ -396,13 +389,19 @@ export class OpenClawLink {
     const cwd = typeof req.cwd === 'string' ? req.cwd : ''
     const label = labelFor(sessionKey, typeof req.turnSourceChannel === 'string' ? req.turnSourceChannel : '')
     const tool = kind === 'exec' ? 'exec' : String(req.toolName || req.pluginId || 'plugin')
+    const command = typeof req.command === 'string' ? req.command : null
+    const host = typeof req.host === 'string' && req.host && req.host !== 'gateway' ? req.host : ''
     const text = kind === 'exec'
-      ? `${typeof req.command === 'string' ? req.command : '(command)'}${cwd ? `\ncwd: ${cwd}` : ''}`
+      ? `${command ?? '(command)'}${cwd ? `\ncwd: ${cwd}` : ''}${host ? `\nhost: ${host}` : ''}` +
+        `${typeof req.nodeId === 'string' && req.nodeId ? `\nnode: ${req.nodeId}` : ''}` +
+        `${typeof req.warningText === 'string' && req.warningText ? `\n! ${req.warningText}` : ''}`
       : `${req.title || tool}${req.description ? `\n${req.description}` : ''}`
+    // an exec card is complete only when it shows the command itself and no run plan we do not render (point 3)
+    const complete = kind !== 'exec' || (command !== null && (req.systemRunPlan === null || req.systemRunPlan === undefined))
     const entry = { rid: '', kind }
     this.pending.set(approvalId, entry)
     const answer = this.service.requestPerm(
-      { sid, cwd: '', tool, input: { id: approvalId, command: req.command ?? null, title: req.title ?? null }, agentId: null, agentType: '', cardText: text, label },
+      { sid, cwd: '', tool, input: { id: approvalId, command: req.command ?? null, title: req.title ?? null }, agentId: null, agentType: '', cardText: text, cardComplete: complete, label },
       {}, { agent: 'openclaw', ttlMs: ttlS * 1000, onCreate: (perm) => { entry.rid = perm.rid } },
     )
     this.log('oc_perm', { kind })

@@ -12,8 +12,8 @@
 import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
-import { spawn, spawnSync } from 'node:child_process'
 import { hooksDir, installScripts, q } from './hookfiles.js'
+import { isAbsPath, parseShim, runSync, start } from '../exec.js'
 
 export const id = 'codex'
 export const caps = { perm: 'prompt-only', say: 'queue' } // say: `codex queue`; fallback 'stop-hold' (Codex before 0.171)
@@ -51,15 +51,18 @@ export function resolveLaunch() {
     if (/\.js$/i.test(p)) return exists(p) ? { cmd: process.execPath, prefix: [p] } : null
     if (/\.(cmd|bat)$/i.test(p)) {
       const js = path.join(path.dirname(p), 'node_modules', '@openai', 'codex', 'bin', 'codex.js')
-      return exists(js) ? { cmd: process.execPath, prefix: [js] } : null
+      if (exists(js)) return { cmd: process.execPath, prefix: [js] }
+      try { return exists(p) ? parseShim(p, fs.readFileSync(p, 'utf8')) : null } catch { return null }
     }
     return exists(p) ? { cmd: p, prefix: [] } : null
   }
+  // an override must be an absolute path; PATH entries that are empty or relative (= the current folder) are skipped
   const forced = process.env.HINTY_AGENTS_CODEX
-  if (forced) return norm(forced)
+  if (forced) return isAbsPath(forced) ? norm(forced) : null
   const names = process.platform === 'win32' ? ['codex.exe', 'codex.cmd'] : ['codex']
-  for (const dir of String(process.env.PATH || '').split(path.delimiter)) {
-    if (!dir) continue
+  for (let dir of String(process.env.PATH || '').split(path.delimiter)) {
+    dir = dir.trim().replace(/^"(.*)"$/, '$1')
+    if (!isAbsPath(dir)) continue
     for (const n of names) {
       const hit = norm(path.join(dir, n))
       if (hit) return hit
@@ -75,7 +78,7 @@ export function resolveLaunch() {
 export function run(args, o = {}) {
   const launch = resolveLaunch()
   if (!launch) return { ok: false, code: null, stdout: '', stderr: 'codex not found', missing: true }
-  const r = spawnSync(launch.cmd, [...launch.prefix, ...args], { encoding: 'utf8', timeout: o.timeoutMs ?? 60000, windowsHide: true, stdio: ['ignore', 'pipe', 'pipe'] })
+  const r = runSync(launch, args, { encoding: 'utf8', timeout: o.timeoutMs ?? 60000, stdio: ['ignore', 'pipe', 'pipe'] })
   return { ok: r.status === 0, code: r.status, stdout: String(r.stdout || ''), stderr: String(r.stderr || ''), missing: !!r.error && /** @type {any} */ (r.error).code === 'ENOENT' }
 }
 
@@ -107,8 +110,8 @@ export function queueMessage(sid, text, home) {
     let done = false
     const finish = (/** @type {boolean} */ v) => { if (!done) { done = true; resolve(v) } }
     try {
-      const child = spawn(launch.cmd, [...launch.prefix, 'queue', `--thread=${sid}`, `--message=${text}`], {
-        env: { ...process.env, ...(home ? { CODEX_HOME: home } : {}) }, stdio: ['ignore', 'ignore', 'ignore'], windowsHide: true,
+      const child = start(launch, ['queue', `--thread=${sid}`, `--message=${text}`], {
+        env: home ? { CODEX_HOME: home } : {}, stdio: ['ignore', 'ignore', 'ignore'],
       })
       const timer = setTimeout(() => { try { child.kill() } catch { /* gone */ } finish(false) }, 30000)
       child.on('error', () => { clearTimeout(timer); finish(false) })

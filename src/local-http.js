@@ -1,22 +1,20 @@
 // @ts-check
-// Local HTTP port of the service (N9): 127.0.0.1 only, random port, a secret header on every request, and anything
-// that looks like a browser (Origin, Sec-Fetch-*) or a foreign Host header is refused. Answers carry a proof
-// (HMAC of the caller's nonce and the body) so the hook and the mod know they talk to the real service.
+// Local HTTP port of the service (N9): 127.0.0.1 only, random port. Anything that looks like a browser (Origin,
+// Sec-Fetch-*) or carries a foreign Host header is refused, and every request must be signed with the key from
+// daemon.json (protocol v2, src/localauth.js): the key itself never travels. A 200 answer is signed over the request's
+// nonce, so the hook, the mod, the CLI and the Hermes plugin know they talk to the real service.
 import http from 'node:http'
-import { proof, safeEqual } from './crypto.js'
+import { H, NonceCache, PV, headerProblem, requestValid, responseSig } from './localauth.js'
 
-export const SECRET_HEADER = 'x-hinty-secret'
-export const NONCE_HEADER = 'x-hinty-nonce'
-export const PROOF_HEADER = 'x-hinty-proof'
 const MAX_BODY = 1024 * 1024
 const LOOPBACK = new Set(['127.0.0.1', '::ffff:127.0.0.1'])
 
 /**
- * Why a request is refused, or null when it may pass. Exported for tests.
- * @param {{ remoteAddress?: string | null, headers: http.IncomingHttpHeaders }} req @param {string} secret
+ * Why a request is refused before its body is read, or null when it may go on. Exported for tests.
+ * @param {{ remoteAddress?: string | null, headers: http.IncomingHttpHeaders }} req @param {number} [now]
  * @returns {{ status: number, reason: string } | null}
  */
-export function guard(req, secret) {
+export function guard(req, now = Date.now()) {
   if (!LOOPBACK.has(String(req.remoteAddress || ''))) return { status: 403, reason: 'not_loopback' }
   const h = req.headers
   if (h.origin !== undefined) return { status: 403, reason: 'origin' }
@@ -26,27 +24,31 @@ export function guard(req, secret) {
   if (h.host !== undefined && !/^(127\.0\.0\.1|localhost)(:\d{1,5})?$/i.test(String(h.host))) {
     return { status: 403, reason: 'host' }
   }
-  if (!safeEqual(h[SECRET_HEADER], secret)) return { status: 401, reason: 'secret' }
+  const bad = headerProblem(h, now)
+  if (bad) return { status: 401, reason: bad }
   return null
 }
 
 /**
  * @typedef {(body: any, ctl: { onAbort: (fn: () => void) => void }) => any} Handler
- * @param {{ secret: string, routes: Record<string, Handler>, log?: (m: string, f?: Record<string, any>) => void }} o
+ * @param {{ key: string, routes: Record<string, Handler>, log?: (m: string, f?: Record<string, any>) => void, now?: () => number }} o
  * @returns {http.Server}
  */
 export function createLocalServer(o) {
   const log = o.log || (() => {})
+  const now = o.now || Date.now
+  const nonces = new NonceCache()
+  /** @param {http.ServerResponse} res @param {number} status @param {string} reason */
+  const refuse = (res, status, reason) => {
+    log('http_refused', { reason })
+    res.writeHead(status, { 'content-type': 'application/json', connection: 'close' })
+    res.end(JSON.stringify({ error: reason }))
+  }
   const server = http.createServer((req, res) => {
-    const deny = guard({ remoteAddress: req.socket.remoteAddress, headers: req.headers }, o.secret)
-    if (deny) {
-      log('http_refused', { reason: deny.reason })
-      res.writeHead(deny.status, { 'content-type': 'application/json', connection: 'close' })
-      res.end(JSON.stringify({ error: deny.reason }))
-      req.resume()
-      return
-    }
-    const key = `${req.method} ${String(req.url || '').split('?')[0]}`
+    const deny = guard({ remoteAddress: req.socket.remoteAddress, headers: req.headers }, now())
+    if (deny) { refuse(res, deny.status, deny.reason); req.resume(); return }
+    const url = String(req.url || '')
+    const key = `${req.method} ${url.split('?')[0]}`
     const route = o.routes[key]
     if (!route) {
       res.writeHead(404, { 'content-type': 'application/json' })
@@ -54,7 +56,6 @@ export function createLocalServer(o) {
       req.resume()
       return
     }
-    const nonce = String(req.headers[NONCE_HEADER] || '').slice(0, 128)
     let size = 0
     /** @type {Buffer[]} */
     const chunks = []
@@ -65,14 +66,15 @@ export function createLocalServer(o) {
       chunks.push(c)
     })
     req.on('end', async () => {
-      if (tooBig) {
-        res.writeHead(413, { 'content-type': 'application/json', connection: 'close' })
-        res.end('{"error":"too_big"}')
-        return
-      }
+      if (tooBig) { refuse(res, 413, 'too_big'); return }
+      const raw = Buffer.concat(chunks)
+      // the signature covers this exact method, path (with any query) and body; each nonce counts once
+      if (!requestValid(o.key, req.headers, String(req.method), url, raw)) { refuse(res, 401, 'auth'); return }
+      const nonce = String(req.headers[H.nonce])
+      if (!nonces.use(nonce, now())) { refuse(res, 401, 'replay'); return }
       let body = null
-      const raw = Buffer.concat(chunks).toString('utf8')
-      if (raw) { try { body = JSON.parse(raw) } catch { body = null } }
+      const text = raw.toString('utf8')
+      if (text) { try { body = JSON.parse(text) } catch { body = null } }
       /** @type {Array<() => void>} */
       const aborts = []
       res.on('close', () => { if (!res.writableEnded) for (const fn of aborts) { try { fn() } catch { /* ignore */ } } })
@@ -84,13 +86,15 @@ export function createLocalServer(o) {
         out = { error: 'internal' }
       }
       if (res.destroyed || res.writableEnded) return
-      const text = JSON.stringify(out ?? {})
+      const answer = Buffer.from(JSON.stringify(out ?? {}), 'utf8')
       res.writeHead(200, {
         'content-type': 'application/json',
         'cache-control': 'no-store',
-        [PROOF_HEADER]: proof(o.secret, nonce, text),
+        'content-length': answer.length,
+        [H.pv]: String(PV),
+        [H.sig]: responseSig(o.key, nonce, 200, answer),
       })
-      res.end(text)
+      res.end(answer)
     })
   })
   server.requestTimeout = 30000

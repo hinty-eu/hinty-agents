@@ -13,7 +13,7 @@
 import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
-import { spawnSync } from 'node:child_process'
+import { resolveProgram, runSync } from '../exec.js'
 import { readConfig } from '../store.js'
 import { hooksDir, installScripts, q } from './hookfiles.js'
 
@@ -24,26 +24,25 @@ export const MARKER = 'grok-hook.cjs'
 /** How long the service waits for a card, seconds; the hook's own timeout is this plus 20 s. */
 export const ASK_HOLD_S = 280
 
-/** Shell commands that never get a card (each chained segment must match; see isExcepted). */
+/**
+ * Shell commands that never get a card (see isExcepted). Since the security review (point 9) without `npm test` /
+ * `npm run test` (they run a script the agent can edit) and `git branch` (`-D` deletes).
+ */
 export const DEFAULT_EXCEPT = [
   'ls', 'dir', 'pwd', 'cd', 'cat', 'head', 'tail', 'wc', 'echo', 'which', 'where', 'whoami', 'date', 'type',
-  'git status', 'git diff', 'git log', 'git show', 'git branch', 'git rev-parse', 'git remote -v',
-  'node --version', 'node -v', 'npm --version', 'npm -v', 'npm ls', 'npm run test', 'npm test',
+  'git status', 'git diff', 'git log', 'git show', 'git rev-parse', 'git remote -v',
+  'node --version', 'node -v', 'npm --version', 'npm -v', 'npm ls',
 ]
 
 export const grokHome = () => process.env.HINTY_AGENTS_GROK_HOME || process.env.GROK_HOME || path.join(os.homedir(), '.grok')
 export const hooksFile = () => path.join(grokHome(), 'hooks', FILE)
 
-/** HINTY_AGENTS_GROK = path of the `grok` executable; default `grok` from PATH. */
-const grokBin = () => process.env.HINTY_AGENTS_GROK || 'grok'
-const quoteWin = (/** @type {string} */ p) => (/^[A-Za-z0-9_@%+=:,./\\-]+$/.test(p) ? p : `"${p.replace(/"/g, '\\"')}"`)
-
 /** @returns {{ found: boolean, version: string | null }} */
 export function detect() {
-  const win = process.platform === 'win32'
-  const r = win
-    ? spawnSync([grokBin(), '--version'].map(quoteWin).join(' '), { shell: true, encoding: 'utf8', timeout: 30000, windowsHide: true, stdio: ['ignore', 'pipe', 'pipe'] })
-    : spawnSync(grokBin(), ['--version'], { encoding: 'utf8', timeout: 30000, stdio: ['ignore', 'pipe', 'pipe'] })
+  // HINTY_AGENTS_GROK = an absolute path of the `grok` executable; default: `grok` by our own PATH lookup, no shell
+  const launch = resolveProgram('grok', process.env.HINTY_AGENTS_GROK)
+  if (!launch) return { found: false, version: null }
+  const r = runSync(launch, ['--version'], { encoding: 'utf8', timeout: 30000, stdio: ['ignore', 'pipe', 'pipe'] })
   if (r.status !== 0) return { found: false, version: null }
   const m = String(r.stdout || '').match(/(\d+\.\d+\.\d+)/)
   return { found: true, version: m ? m[1] : String(r.stdout || '').trim().slice(0, 40) }
@@ -142,17 +141,27 @@ export function exceptions() {
   return Array.isArray(own) && own.every((x) => typeof x === 'string') ? own : DEFAULT_EXCEPT
 }
 
+/** Options that make a read-only command write a file or run something (git diff --output=x, git -c, --ext-diff...). */
+const RISKY_ARG = /^(?:-o|--output(?:=|$)|--output-directory|--ext-diff|--textconv|--exec|--upload-pack|--receive-pack|--config|--git-dir|--work-tree|--namespace|-c$|-C$)/
+
 /**
- * Is this shell command harmless enough to skip the card? Every chained segment must start with an exception (whole
- * words), and no substitution, redirection or newline is allowed anywhere. Pure.
+ * Is this shell command harmless enough to skip the card? Security review point 9: ONE command, no chaining at all
+ * (`&`, `;`, `|`), no redirection, substitution, variable, glob escape or newline; it must start with an exception
+ * (whole words), no argument may make it write or run something, and a file argument of cat/head/tail/wc/type must
+ * stay inside the project (no absolute path, `..`, `~`). Pure.
  * @param {string} command @param {string[]} list
  */
 export function isExcepted(command, list = DEFAULT_EXCEPT) {
   const c = String(command || '').trim()
-  if (!c || /[`<>\n\r]|\$\(|\$\{/.test(c)) return false
-  const segments = c.split(/&&|\|\||;|\|/).map((s) => s.trim())
-  if (!segments.length || segments.some((s) => !s)) return false
-  return segments.every((seg) => list.some((p) => seg === p || seg.startsWith(`${p} `)))
+  if (!c || c.length > 500 || /[`<>&;|\n\r$\\^%!'"(){}[\]*?]/.test(c) || /[\x00-\x1f\x7f-\x9f]/.test(c)) return false
+  const p = list.find((x) => typeof x === 'string' && x && (c === x || c.startsWith(`${x} `)))
+  if (!p) return false
+  const args = c.slice(p.length).trim().split(/\s+/).filter(Boolean)
+  if (args.some((a) => RISKY_ARG.test(a) || /^--?[A-Za-z-]+=/.test(a) && /output|exec|config|dir|path|file/i.test(a))) return false
+  if (/^(cat|head|tail|wc|type)$/.test(p.split(' ')[0])) {
+    if (args.some((a) => /^[\\/~]|^[A-Za-z]:|(^|[\\/])\.\.([\\/]|$)/.test(a))) return false
+  }
+  return true
 }
 
 /** Does this tool name look like a shell? (the exact name Grok uses is not documented) @param {string} name */

@@ -15,7 +15,7 @@ is open because it approves commands on your machine: read it before you run it.
 
 ```
 Claude Code ──PermissionRequest / SessionStart hooks──┐
-            ──mod (session status, instructions)──────┤ 127.0.0.1, random port, secret
+            ──mod (session status, instructions)──────┤ 127.0.0.1, random port, signed requests
                                                       ▼
                                   hinty-agents service (one per computer)
                                                       │ Socket.IO, bridge token
@@ -39,17 +39,41 @@ Claude Code ──PermissionRequest / SessionStart hooks──┐
 
 ## Security
 
+### Who can do what
+
+The parts that can act on your computer are the agent (your own Claude Code, Codex... session), this service, and
+whoever sends it events through the Hinty relay. The relay is the Hinty server; anyone who controls your Hinty account
+(password, session) can use it too. Plan for that:
+
+| | The relay / your Hinty account can | It can never |
+|---|---|---|
+| Away mode OFF | see that this computer is paired and online (`hello`: host name, which agents are installed, voice yes/no), switch away mode **on only if you allowed it** (below) | see sessions, prompts or answers; send instructions; approve anything |
+| Away mode ON | see session names, status lines, permission cards and the last answers; **send instructions** that reach an open agent session as your message; **allow once or deny** a waiting permission request whose card shows everything that will run; switch away mode off | widen your permission rules or change a command (only *allow once* / *deny* exist), allow a request whose card is incomplete, act without an open agent session, read files on its own, extend away mode past 12 hours |
+
+So while away mode is on, the relay and your Hinty account are trusted like a person at your keyboard who can type
+into an open session and press *allow once*. That is the point of the feature; keep it on only while you are away,
+and protect your Hinty account. End-to-end encryption between this computer and your screen is planned.
+"A replayed or forged decision is ignored" below protects you against third parties, not against the relay itself.
+
+### Rules in the code
+
 | Rule | What the code does |
 |---|---|
-| No answer means no decision | Service down, away mode off, link lost, refused by the relay, time up (840 s, before the hook's 900 s limit), any error: the hook prints nothing and exits 0, so Claude Code asks in the terminal as usual. It never approves on its own. |
-| Allow once or deny, nothing else | The hook can print exactly two fixed JSON answers. It never sends `updatedInput` or `updatedPermissions`, so a remote answer can neither change the command nor widen your permission rules. Claude Code's own `deny` rules still win. |
-| A decision must match | Accepted only while away mode is on, for a request id (128 random bits, single use) this service created, still waiting, not expired, and with the SHA-256 hash of exactly what was asked (`rid`, session, sub-agent, tool, tool input). A replayed or forged decision is ignored. |
-| Away mode is opt-in | Off by default and after every restart. While off, nothing about your sessions leaves the computer (no status, no prompts, no answers) and the hook answers at once. It turns itself off after 12 hours. |
-| Secrets are masked | Before any text leaves: `sk-…`, `ghp_…`, `AKIA…`, `Bearer …`, `password=…`, JWTs, private keys, credentials in URLs and similar are replaced with `***`. Best effort, not a guarantee. |
-| Local port | Listens on `127.0.0.1` only, random port, a random secret header on every request (`~/.hinty-agents/daemon.json`, readable by you only). Requests with an `Origin`, `Sec-Fetch-*` or foreign `Host` header (browsers) are refused. Every answer carries an HMAC proof, so a process that grabbed a stale port cannot answer for the service. |
-| The relay keeps no content | The Hinty server holds cards and session status in memory only (minutes); the database stores only a hash of this computer's token. Content crosses the server in transit (TLS). End-to-end encryption is planned. |
+| No answer means no decision | Service down, away mode off, link lost, refused by the relay, time up (840 s, before the hook's 900 s limit), another protocol version, any error: the hook prints nothing and exits 0, so the agent asks in the terminal as usual. It never approves on its own. |
+| Allow once or deny, nothing else | The hook can print exactly two fixed JSON answers. It never sends `updatedInput` or `updatedPermissions`, so a remote answer can neither change the command nor widen your permission rules. The agent's own `deny` rules still win. |
+| A decision must match | Accepted only while away mode is on, for a request id (128 random bits, single use) this service created, still waiting, not expired, and with the SHA-256 hash of exactly what was asked (`rid`, session, sub-agent, tool, tool input). A replayed or forged decision from anyone else is ignored. |
+| Incomplete cards can only be denied | When the card does not show everything that will run (something was cut, a secret was masked or a value was left visible on purpose, invisible or control characters were removed, blank lines folded, a field has a shape the bridge does not know), it is sent with `part: true`. The glasses and the panel offer only *Deny*, and **this service itself refuses a remote *allow*** for it, whatever the relay says. Approve such a request in the terminal. Every cut on a card is marked (`[… cut: 7,000 of 48,211 characters shown]`). |
+| Away mode is opt-in | Off by default and after every restart. While off, nothing about your sessions leaves the computer and the hook answers at once. It turns itself off 12 hours after it was switched on. |
+| Remote switch-on needs your consent | The Hinty panel or the glasses can switch away mode **on** only if you allowed it on this computer (the setup wizard asks once; `npx hinty-agents remote-away on\|off`; default **off**). Without it a remote switch-on is refused and logged. A remote switch-on never extends the 12 hours, and it is always visible here: Claude Code's status line and a toast, a system notification, `npx hinty-agents status`, the log. Switching it **off** remotely always works. |
+| Pairing shows the account | After the code is typed in the panel, the terminal shows the (masked) account that typed it and asks *Is this your account?*; only `y` keeps the pairing. Anything else, or no answer, disconnects the computer again. Type the code only in your own panel, and do not show it on a shared screen. |
+| Secrets are masked | Before any text leaves: `sk-…`, `ghp_…`, `AKIA…`, `Bearer …`, `password=…`, JWTs, private keys, credentials in URLs and similar are replaced with `***` (and the card becomes incomplete). A value that contains shell syntax (`$(`, backticks, `;`, `|`, `&`, `<`, `>`) is never hidden: it may be the part that runs. Best effort, not a guarantee. |
+| Instructions are plain text | Every instruction is cleaned (no control or invisible characters) and every line that starts with `/ ! # @ $` gets a zero-width space in front, so it can never become a slash command, bash mode, a memory note or an OpenClaw `/approve` (see below). |
+| Local port | Listens on `127.0.0.1` only, random port. The key in `~/.hinty-agents/daemon.json` (readable by you only) **never travels**: every request from a hook, the mod, the CLI or the Hermes plugin is signed with it (HMAC-SHA256 over a one-time nonce, a timestamp, method, path and the body's SHA-256; 30 s window, a nonce counts once), and every answer is signed over the request's nonce, the status and the body. A process that grabbed a stale port after a crash or reboot learns nothing and cannot answer for the service; a stale `daemon.json` is removed when the service starts. Requests with an `Origin`, `Sec-Fetch-*` or foreign `Host` header (browsers) are refused. Protocol version 2 (`pv` in `daemon.json`): hooks, mod and service of different versions stay silent (no answer = the agent asks as usual); `doctor` tells you what to update. |
+| No programs from the current folder | On Windows, programs (`claude`, `npm`, `codex`, `openclaw`, `hermes`, `icacls`, `taskkill`) are found by the bridge's own `PATH` lookup (never the current folder) and started without a shell, with `NoDefaultCurrentDirectoryInExePath=1`. `stop` kills a process only after checking it is this service. `HINTY_AGENTS_HOME` counts only as an absolute path, and the hooks start the service only from an installed hinty-agents outside the session's project folder. |
+| The relay keeps no content | The Hinty server holds cards and session status in memory only (minutes); the database stores only a hash of this computer's token. Content crosses the server in transit (TLS). |
 
-Logs (`~/.hinty-agents/daemon.log`) hold identifiers and counts only, never commands or answers.
+Logs (`~/.hinty-agents/daemon.log`) hold identifiers and counts only, never commands or answers, one event per line.
+The Claude Code mod writes an instruction's id and length (not its text) to Claude Code's own debug log.
 
 ## Install
 
@@ -76,8 +100,8 @@ claude plugin install hinty-agents@hinty-agents --scope user
 New Claude Code sessions load it (open ones: `/reload-plugins` or restart). Then, when you leave the desk:
 
 ```bash
-npx hinty-agents away on      # or switch it on in the panel
-npx hinty-agents away off     # back at the desk
+npx hinty-agents away on      # or in the panel, if you allowed remote switch-on
+npx hinty-agents away off     # back at the desk (the panel and the glasses can always switch it off)
 ```
 
 ## Commands
@@ -87,17 +111,18 @@ npx hinty-agents away off     # back at the desk
 | `npx hinty-agents` | set up (options: `--no-install`, `--no-start`, `--label <name>`) |
 | `status` | service, link, away mode, sessions |
 | `away on\|off` | away-from-desk mode |
+| `remote-away on\|off` | allow (or not) the Hinty panel / glasses to switch away mode ON (default off; off always works) |
 | `install <claude\|codex\|grok\|openclaw\|hermes>` / `uninstall <...>` | add or remove an agent's integration (`install grok --ask-shell`: see Grok Build; `install openclaw --token-file <file>`: see OpenClaw) |
 | `doctor` | checks Node, Claude Code, the plugin (`claude plugin validate`), the service, the link, the hook and whether the mod reports in |
 | `unpair` | disconnect this computer from your account and delete the token |
 | `voice install` / `status` / `remove` | local speech to text for dictation from the glasses (see Voice) |
-| `voice install|status|remove` | local speech to text for dictation from the glasses (see Voice) |
 | `start` / `stop` | start or stop the background service (`stop` also keeps it from starting with the next session) |
 
 After a reboot the SessionStart hook starts the service again (unless you ran `stop`).
 
-Environment: `HINTY_AGENTS_API` (server for a new pairing, default `https://api.v1.hinty.eu`),
-`HINTY_AGENTS_HOME` (data folder, default `~/.hinty-agents`).
+Environment: `HINTY_AGENTS_API` (server for a new pairing, default `https://api.v1.hinty.eu`; another server is
+announced with a warning, plain `http` only to this computer), `HINTY_AGENTS_HOME` (data folder, default
+`~/.hinty-agents`; an absolute path, a relative one is ignored).
 
 ## Codex CLI
 
@@ -144,8 +169,10 @@ with Grok's documented hook input and output (docs.x.ai/build/features/hooks).
 
 **Read this before `--ask-shell`: Grok hooks fail open.** Grok can block a step only from `PreToolUse`, and when the hook
 crashes, times out or the service is down, Grok **runs the step**. So with `--ask-shell`:
-- a card appears for each shell command that is not on the harmless list (`ls`, `pwd`, `cat`, `git status|diff|log`, ...;
-  every chained segment must match, and `$(...)`, backticks and redirection are never harmless). Own list:
+- a card appears for each shell command that is not on the harmless list (`ls`, `pwd`, `cat`, `git status|diff|log`, ...).
+  Only ONE plain command is ever harmless: any chaining (`&`, `;`, `|`), redirection, `$`, backticks, quotes, options that
+  write or run something (`--output=`, `-o`, `--ext-diff`...) and `cat`/`head`/`tail` paths outside the project (absolute,
+  `..`, `~`) always get a card. `npm test` is not on the list (it runs a script the agent can edit). Own list:
   `"grok": {"except": [...]}` in `~/.hinty-agents/config.json`;
 - **Deny** vetoes the step. **Allow** only means "no veto": Grok's own permission prompt still applies;
 - if nobody answers within 280 s, the service is down, away mode is off or anything fails, the step runs (as Grok does with

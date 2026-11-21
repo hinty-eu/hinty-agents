@@ -8,7 +8,7 @@ import { PermTable } from './perms.js'
 import { SessionTable, SID_RE } from './sessions.js'
 import * as codex from './adapters/codex.js'
 import * as grok from './adapters/grok.js'
-import { glassesLine, oneLine, permText, relayText, safeInstruction } from './text.js'
+import { finishCard, glassesLine, oneLine, permText, relayText, sayText } from './text.js'
 import { Utterances } from './stt/utterance.js'
 
 export const PROTOCOL_V = 1
@@ -42,7 +42,10 @@ export class Service {
    *   voice?: { engine: import('./stt/utterance.js').Engine, ready: () => boolean },
    *   agents?: () => { agents: string[], grok?: { askShell: boolean, except: string[] } },
    *   codexQueue?: ((sid: string, text: string, home?: string) => Promise<boolean>) | null,
-   *   codexPermTtlMs?: number, codexStopHoldMs?: number, grokPermTtlMs?: number }} o
+   *   codexPermTtlMs?: number, codexStopHoldMs?: number, grokPermTtlMs?: number,
+   *   remoteAwayAllowed?: () => boolean, onRemoteAway?: (at: number) => void }} o
+   *   remoteAwayAllowed: did the person agree (config.json `remoteAwayOn`) that the relay may switch away mode ON?
+   *   Read at every remote `away {on:true}`; default no. onRemoteAway: a remote switch-on happened (local notice).
    */
   constructor(o) {
     this.relay = o.relay
@@ -54,6 +57,8 @@ export class Service {
     this.sessDebounceMs = o.sessDebounceMs ?? 250
     this.host = oneLine(o.host ?? os.hostname(), 60)
     this.onUnpaired = o.onUnpaired || (() => {})
+    this.remoteAwayAllowed = o.remoteAwayAllowed || (() => false)
+    this.onRemoteAway = o.onRemoteAway || (() => {})
     this.away = new AwayMode({ now: this.now, maxMs: o.awayMaxMs, onChange: (on, why) => this.onAwayChange(on, why) })
     this.voiceReady = o.voice ? o.voice.ready : () => false
     // E4: which agents are installed (for `hello`) and the Grok ask-shell option; read again on `agentsChanged()`
@@ -61,6 +66,8 @@ export class Service {
     /** `codex queue` (set by the daemon once it knows this Codex has it); null = instructions go through a held Stop hook */
     this.codexQueue = o.codexQueue ?? null
     this.codexQueueBroken = false
+    /** consecutive `codex queue` failures; the queue is given up only after 3 in a row (one bad call is not enough) */
+    this.codexQueueFails = 0
     this.codexPermTtlMs = o.codexPermTtlMs ?? CODEX_PERM_TTL_MS
     this.codexStopHoldMs = o.codexStopHoldMs ?? CODEX_STOP_HOLD_MS
     this.grokPermTtlMs = o.grokPermTtlMs ?? GROK_PERM_TTL_MS
@@ -100,6 +107,8 @@ export class Service {
     this.cmdSeq = 0
     this.lastRefresh = 0
     this.relayInfo = { lastError: /** @type {string | null} */ (null), readyAt: 0 }
+    /** the last remote attempt to switch away mode on without the person's consent (for `status`) */
+    this.remoteRefusedAt = 0
     this.startedAt = this.now()
   }
 
@@ -163,7 +172,8 @@ export class Service {
 
   /** @param {import('./perms.js').Perm & { shownTool?: string }} p @param {number} exp */
   permPayload(p, exp) {
-    return { rid: p.rid, sid: p.sid, tool: p.shownTool || oneLine(p.tool, 80), text: p.text, hash: p.hash, exp }
+    // `part: true`: the card does not show everything that will run; the viewer and the glasses may only deny it
+    return { rid: p.rid, sid: p.sid, tool: p.shownTool || oneLine(p.tool, 80), text: p.text, hash: p.hash, exp, ...(p.part ? { part: true } : {}) }
   }
 
   // ------------------------------------------------------------------------------------------------
@@ -189,15 +199,17 @@ export class Service {
   /**
    * The part of a permission request every agent shares: a card, a wait, one of {} / {d}. The caller has checked
    * paired / link / away mode and the shape of `n` (N1).
-   * @param {{ sid: string, cwd: string, tool: string, input: unknown, agentId: string | null, agentType: string, home?: string, cardText?: string, label?: string }} n
+   * @param {{ sid: string, cwd: string, tool: string, input: unknown, agentId: string | null, agentType: string, home?: string, cardText?: string, cardComplete?: boolean, label?: string }} n
    * @param {Ctl} ctl @param {{ agent: string, ttlMs: number, onCreate?: (p: import('./perms.js').Perm) => void }} o
    * @returns {Promise<HookAnswer>}
    */
   async requestPerm(n, ctl, o) {
     const { sid, tool, agentId, agentType } = n
     this.sessions.touch({ sid, cwd: n.cwd, agent: o.agent, home: n.home, label: n.label })
+    // what the person will see, and whether it is everything that will run (security review point 3)
+    const card = n.cardText !== undefined ? finishCard(n.cardText, n.cardComplete !== false, tool) : permText(tool, n.input)
     const perm = /** @type {import('./perms.js').Perm & { shownTool?: string }} */ (this.perms.create({
-      sid, agentId, tool, input: n.input, text: n.cardText !== undefined ? (relayText(n.cardText).trim() || `(${oneLine(tool, 40)})`) : permText(tool, n.input), ttlMs: o.ttlMs,
+      sid, agentId, tool, input: n.input, text: card.text, part: !card.complete, ttlMs: o.ttlMs,
     }))
     o.onCreate?.(perm)
     perm.shownTool = oneLine(agentType ? `${tool} › ${agentType}` : tool, 80)
@@ -212,7 +224,7 @@ export class Service {
     const s = this.sessions.get(sid)
     if (s) this.send('sess', this.sessPayload(s))
     this.send('perm', this.permPayload(perm, Math.floor(o.ttlMs / 1000)))
-    this.log('perm_in', { rid: perm.rid, t: perm.createdAt })
+    this.log('perm_in', { rid: perm.rid, t: perm.createdAt, part: perm.part || undefined })
     return /** @type {Promise<HookAnswer>} */ (answer)
   }
 
@@ -376,8 +388,9 @@ export class Service {
   async codexStop(input, ctl = {}) {
     const n = this.agentStopState('codex', input)
     if (!n || !this.hooksLive()) return {}
-    if (this.codexQueue && !this.codexQueueBroken) return {} // instructions arrive through `codex queue`; the turn just ends
     const sid = n.sid
+    // instructions arrive through `codex queue`; the turn just ends, unless one fell back here after a failed queue call
+    if (this.codexQueue && !this.codexQueueBroken && !(this.cmds.get(sid) || []).length) return {}
     if (!n.stopActive) this.continuations.set(sid, 0)
     if ((this.continuations.get(sid) || 0) >= MAX_CONTINUATIONS) { this.log('say_refused', { reason: 'limit' }); return {} }
     if (!(this.cmds.get(sid) || []).length) {
@@ -432,7 +445,7 @@ export class Service {
   async modPoll(body, ctl = {}) {
     if (!isObj(body) || typeof body.sid !== 'string' || !SID_RE.test(body.sid)) return { away: false, cmds: [] }
     const sid = body.sid
-    if (this.isEnded(sid)) return { away: this.away.isOn(), cmds: [] }
+    if (this.isEnded(sid)) return { away: this.away.isOn(), cmds: [], ...this.remoteMark() }
     const { isNew } = this.sessions.touch({
       sid, cwd: typeof body.cwd === 'string' ? body.cwd : '', fromMod: true,
       interactive: typeof body.interactive === 'boolean' ? body.interactive : undefined,
@@ -441,7 +454,7 @@ export class Service {
     const take = () => {
       const q = this.cmds.get(sid) || []
       this.cmds.delete(sid)
-      return { away: this.away.isOn(), cmds: q }
+      return { away: this.away.isOn(), cmds: q, ...this.remoteMark() }
     }
     if ((this.cmds.get(sid) || []).length) return take()
     // the mod's idea of away mode is wrong (first poll, or it changed meanwhile): answer at once
@@ -468,6 +481,11 @@ export class Service {
     this.cmds.set(sid, q)
     this.log('say_in', { id })
     this.wake(sid)
+  }
+
+  /** `{remote: <ms>}` while away mode is on because the relay switched it on (the mod shows it), else nothing. */
+  remoteMark() {
+    return this.away.isOn() && this.away.by === 'remote' ? { remote: this.away.since } : {}
   }
 
   /** @param {string} sid */
@@ -586,9 +604,11 @@ export class Service {
         if (!isObj(payload) || !exactKeys(payload, 'sid,text')) return
         const { sid } = payload
         const raw = payload.text
-        if (typeof sid !== 'string' || typeof raw !== 'string' || !raw.trim() || raw.length > 8000) return
-        // every road to an agent (mod poll, `codex queue`, held Stop) gets a plain message, never a command
-        const text = safeInstruction(raw)
+        if (typeof sid !== 'string' || typeof raw !== 'string' || raw.length > 8000) return
+        // every road to an agent (mod poll, `codex queue`, held Stop) gets a plain message, never a command, and no
+        // control characters (a NUL breaks `codex queue`)
+        const text = sayText(raw)
+        if (!text.trim()) return
         if (!this.away.isOn() || !this.sessions.get(sid)) {
           this.log('say_refused', { reason: this.away.on ? 'no_session' : 'away_off' })
           return
@@ -607,10 +627,16 @@ export class Service {
         if (sess && sess.agent === 'codex' && this.codexQueue && !this.codexQueueBroken) {
           // Codex 0.171+: `codex queue` puts it in the session as the person's next message
           this.log('say_in', { via: 'queue' })
+          const failed = () => {
+            // this message falls back to the held Stop hook; the queue is given up only after 3 failures in a row
+            if (++this.codexQueueFails >= 3) this.codexQueueBroken = true
+            this.enqueueCmd(sid, text)
+          }
           this.codexQueue(sid, text, sess.home || undefined).then((ok) => {
             this.log('say_done', { via: 'queue', ok })
-            if (!ok) { this.codexQueueBroken = true; this.enqueueCmd(sid, text) } // fall back to the held Stop hook
-          }, () => { this.codexQueueBroken = true; this.enqueueCmd(sid, text) })
+            if (ok) this.codexQueueFails = 0
+            else failed()
+          }, failed)
           return
         }
         this.enqueueCmd(sid, text)
@@ -618,7 +644,7 @@ export class Service {
       }
       case 'away': {
         if (!isObj(payload) || !exactKeys(payload, 'on') || typeof payload.on !== 'boolean') return
-        this.setAway(payload.on, 'remote')
+        this.remoteAway(payload.on)
         return
       }
       case 'want': {
@@ -646,7 +672,8 @@ export class Service {
         return
       case 'denied':
       case 'connect_error':
-        this.relayInfo.lastError = isObj(payload) && typeof payload.reason === 'string' ? payload.reason : String(ev)
+        // text from the server: one short line without control characters before it reaches a terminal or the log
+        this.relayInfo.lastError = oneLine(isObj(payload) && typeof payload.reason === 'string' ? payload.reason : String(ev), 60)
         return
       default:
     }
@@ -656,11 +683,36 @@ export class Service {
   // Away mode
   // ------------------------------------------------------------------------------------------------
 
-  /** @param {boolean} on @param {string} why */
+  /** At this computer (`away on|off`): switching on again starts the 12 h again. @param {boolean} on @param {string} why */
   setAway(on, why) {
     const changed = this.away.set(on, why)
     if (!changed && on) this.send('away', { on: true }) // renewed: report again (12 h from now)
     return { away: this.away.on, until: this.away.until }
+  }
+
+  /**
+   * `away {on}` from the relay (panel, glasses). OFF always works. ON only with the person's consent given at this
+   * computer (config.json `remoteAwayOn`); without it the request is refused and the bridge keeps reporting `off`.
+   * A remote ON never extends the 12 h of a mode that is already on. Every remote switch-on is logged and reported
+   * locally (status, the Claude Code status line and a toast, a system notification).
+   * @param {boolean} on
+   */
+  remoteAway(on) {
+    if (!on) { this.away.set(false, 'remote'); return }
+    if (this.away.isOn()) {
+      this.log('away_remote_on', { result: 'already_on' })
+      this.send('away', { on: true })
+      return
+    }
+    if (!this.remoteAwayAllowed()) {
+      this.remoteRefusedAt = this.now()
+      this.log('away_remote_refused', { reason: 'not_allowed_here' })
+      this.send('away', { on: false })
+      return
+    }
+    this.away.set(true, 'remote', { renew: false })
+    this.log('away_remote_on', { result: 'on', at: new Date(this.away.since).toISOString() })
+    try { this.onRemoteAway(this.away.since) } catch { /* a notice never breaks the service */ }
   }
 
   /** @param {boolean} on @param {string} why */
@@ -741,7 +793,10 @@ export class Service {
       startedAt: this.startedAt,
       paired: this.paired,
       relay: { connected: this.relay.connected, lastError: this.relayInfo.lastError, readyAt: this.relayInfo.readyAt },
-      away: { on: this.away.isOn(), until: this.away.until },
+      away: {
+        on: this.away.isOn(), until: this.away.until, since: this.away.since, by: this.away.by,
+        remoteAllowed: this.remoteAwayAllowed(), remoteRefusedAt: this.remoteRefusedAt,
+      },
       sessions: this.sessions.list().map((s) => ({
         sid: s.sid.slice(0, 8), label: s.label, agent: s.agent, st: s.st, mod: !!s.modSeenAt,
         modAgoMs: s.modSeenAt ? this.now() - s.modSeenAt : null, interactive: s.interactive,

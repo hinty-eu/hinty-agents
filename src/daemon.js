@@ -2,23 +2,44 @@
 // The background service (one per computer): relay connection + local HTTP port for the hook and the mod.
 // Started by `hinty-agents start` (or the wizard, or the SessionStart hook after a reboot); stopped by `hinty-agents stop`.
 import fs from 'node:fs'
+import path from 'node:path'
 import { newSecret } from './crypto.js'
+import { pingOwn } from './client.js'
+import { hardenEnv, isOurDaemonLine, processCommandLine } from './exec.js'
+import { daemonRecord } from './localauth.js'
+import { systemNotify } from './notify.js'
+import { SCRIPTS, hooksDir, sourceDir } from './adapters/hookfiles.js'
 import { activeAgents } from './adapters/index.js'
 import * as codex from './adapters/codex.js'
 import * as grok from './adapters/grok.js'
 import { OpenClawLink } from './adapters/openclaw.js'
-import { HermesLink } from './adapters/hermes.js'
+import { HermesLink, pluginDir as hermesPluginDir, pluginSource as hermesPluginSource } from './adapters/hermes.js'
 import { createLocalServer, listenLoopback } from './local-http.js'
 import { createLog } from './log.js'
 import { Relay } from './relay.js'
 import { Service } from './service.js'
 import { voiceReady } from './stt/install.js'
 import { SherpaEngine } from './stt/sherpa.js'
-import { ensureHome, isPaired, paths, pidAlive, readConfig, readJson, updateConfig, writeJson } from './store.js'
+import { ensureHome, isPaired, paths, pidAlive, readConfig, readDaemonInfo, readJson, updateConfig, writeJson } from './store.js'
 import { VERSION } from './version.js'
 
-/** Single instance per computer: an exclusive lock file with our pid (a stale one is taken over). */
-function takeLock() {
+/**
+ * Is this live pid our service? A signed /v1/ping with the same pid says so; else its command line must be
+ * `node .../hinty-agents.js daemon` (security review point 7: a pid reused by another program does not count).
+ * @param {number} pid
+ */
+export async function isOurService(pid) {
+  const info = readDaemonInfo()
+  if (info && info.pid === pid && await pingOwn(info)) return true
+  return isOurDaemonLine(processCommandLine(pid))
+}
+
+/**
+ * Single instance per computer: an exclusive lock file with our pid. A lock left by a dead process, or whose pid now
+ * belongs to another program, is taken over (logged).
+ * @param {(m: string, f?: Record<string, any>) => void} log
+ */
+async function takeLock(log) {
   const { lock } = paths()
   for (let i = 0; i < 2; i++) {
     try {
@@ -26,16 +47,64 @@ function takeLock() {
       return true
     } catch (e) {
       if (/** @type {any} */ (e).code !== 'EEXIST') throw e
-      const other = Number(fs.readFileSync(lock, 'utf8').trim())
-      if (other !== process.pid && pidAlive(other)) return false
+      let other = 0
+      try { other = Number(fs.readFileSync(lock, 'utf8').trim()) } catch { /* raced */ }
+      if (other && other !== process.pid && pidAlive(other)) {
+        if (await isOurService(other)) return false
+        log('lock_stale', { pid: other, why: 'not_our_service' })
+      }
       try { fs.unlinkSync(lock) } catch { /* raced */ }
     }
   }
   return false
 }
 
+/**
+ * The hook scripts the agents run (~/.hinty-agents/hooks) and the Hermes plugin are copies; after an update of this
+ * package they would speak the old local protocol and stay silent. When present, they are refreshed at start.
+ * @param {(m: string, f?: Record<string, any>) => void} log
+ */
+function refreshCopies(log) {
+  try {
+    const dest = hooksDir()
+    if (fs.existsSync(path.join(dest, 'common.cjs'))) {
+      let n = 0
+      for (const f of SCRIPTS) {
+        const src = fs.readFileSync(path.join(sourceDir(), f))
+        const to = path.join(dest, f)
+        let cur = null
+        try { cur = fs.readFileSync(to) } catch { /* missing */ }
+        if (!cur || !cur.equals(src)) { fs.writeFileSync(`${to}.tmp`, src); fs.renameSync(`${to}.tmp`, to); n++ }
+      }
+      if (n) log('hooks_refreshed', { n })
+    }
+  } catch (e) { log('hooks_refresh_failed', { err: /** @type {Error} */ (e)?.name }) }
+  try { if (hermesRefresh()) log('hermes_plugin_refreshed') } catch (e) { log('hermes_refresh_failed', { err: /** @type {Error} */ (e)?.name }) }
+}
+
+/** @returns {boolean} the installed Hermes plugin copy was older and got replaced */
+function hermesRefresh() {
+  const dst = hermesPluginDir()
+  const own = path.join(hermesPluginSource(), '__init__.py')
+  const cur = path.join(dst, '__init__.py')
+  if (!fs.existsSync(cur) || !fs.readFileSync(cur, 'utf8').includes('hinty-agents-marker')) return false
+  let changed = false
+  for (const f of fs.readdirSync(hermesPluginSource(), { withFileTypes: true })) {
+    if (!f.isFile()) continue
+    const src = fs.readFileSync(path.join(hermesPluginSource(), f.name))
+    const to = path.join(dst, f.name)
+    let now = null
+    try { now = fs.readFileSync(to) } catch { /* missing */ }
+    if (!now || !now.equals(src)) { fs.writeFileSync(to, src); changed = true }
+  }
+  return changed && fs.existsSync(own)
+}
+
 export async function runDaemon() {
+  hardenEnv()
   ensureHome()
+  // never keep the folder the service was started from (it may be somebody's repository) as the current folder
+  try { process.chdir(paths().home) } catch { /* stays */ }
   const p = paths()
   const log = createLog(p.log)
   const config = readConfig()
@@ -45,11 +114,14 @@ export async function runDaemon() {
     process.exitCode = 1
     return
   }
-  if (!takeLock()) {
+  if (!(await takeLock(log))) {
     console.error('hinty-agents: the service is already running')
     return
   }
-  const secret = newSecret()
+  // a daemon.json left by a service that died (reboot, kill): gone before we listen (security review point 1)
+  try { fs.unlinkSync(p.daemon) } catch { /* none */ }
+  refreshCopies(log)
+  const key = newSecret()
   const relay = new Relay({ api: config.api, token: /** @type {string} */ (config.bridgeToken), log })
   let stopping = false
 
@@ -59,6 +131,12 @@ export async function runDaemon() {
     agents: () => ({ agents: activeAgents(), grok: { askShell: grok.askShellOn(), except: grok.exceptions() } }),
     relay: { get connected() { return relay.connected }, emit: (ev, payload) => relay.send(ev, payload) },
     log,
+    // the person's consent, given at this computer, read again at every remote request (security review point 2)
+    remoteAwayAllowed: () => readConfig()?.remoteAwayOn === true,
+    onRemoteAway: (at) => {
+      if (readConfig()?.notify === false || process.env.HINTY_AGENTS_NO_NOTIFY === '1') return
+      log('notify', { kind: 'remote_away', started: systemNotify('remote_away', at) })
+    },
     onUnpaired: (why) => {
       log('unpaired', { why })
       updateConfig({ bridgeToken: undefined, bridgeId: undefined })
@@ -83,10 +161,10 @@ export async function runDaemon() {
   }
 
   const server = createLocalServer({
-    secret,
+    key,
     log,
     routes: {
-      'GET /v1/ping': () => ({ ok: true, v: 1, version: VERSION }),
+      'GET /v1/ping': () => ({ ok: true, v: 2, pid: process.pid, version: VERSION }),
       'GET /v1/status': () => ({ ...service.status(), version: VERSION, api: config.api, label: config.label || null, bridgeId: config.bridgeId || null }),
       'POST /v1/hook/permission': (body, ctl) => service.hookPermission(body, ctl),
       'POST /v1/hook/session-start': (body) => service.hookSessionStart(body),
@@ -125,7 +203,7 @@ export async function runDaemon() {
     },
   })
   const port = await listenLoopback(server)
-  writeJson(p.daemon, { v: 1, pid: process.pid, port, secret, startedAt: new Date().toISOString(), version: VERSION })
+  writeJson(p.daemon, daemonRecord({ pid: process.pid, port, key, version: VERSION }))
   log('start', { pid: process.pid, port, v: VERSION })
 
   const ticker = setInterval(() => service.tick(), 5000)

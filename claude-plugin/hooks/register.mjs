@@ -12,18 +12,24 @@
 // The session is identified by `$.session.id()`: the transcript's name, the same id the hooks get as `session_id`.
 // It is read again for every report, because `/clear` moves the process to a new session without a `session.start`.
 //
-// The service is found through ~/.hinty-agents/daemon.json (port and secret). Every answer must carry the service's
-// proof (HMAC of our nonce and the body), so a process squatting a stale port cannot feed instructions.
+// The service is found through ~/.hinty-agents/daemon.json (port and key; $HINTY_AGENTS_HOME only when absolute).
+// Local protocol v2 (src/localauth.js): every request is signed with the key (the key never travels) and every answer
+// must carry the service's signature over our nonce, the status and the body, so a process squatting a stale port
+// can neither read the key nor feed instructions. Another protocol version in daemon.json = the mod stays quiet.
+//
+// While away mode is on the status line shows it (and that it was switched on remotely, from the panel or glasses),
+// and a remote switch-on raises a toast once, so the person at this computer always sees it.
 
-import { hmacSha256Hex, nonce } from './hmac.mjs'
+import { hmacSha256Hex, nonce, sha256Hex } from './hmac.mjs'
 
 /** @typedef {import('claude-code').On} On */
 /** @typedef {import('claude-code').EngineInterface} Engine */
-/** @typedef {{ port: number, secret: string }} Info */
+/** @typedef {{ port: number, key: string }} Info */
 
 const POLL_AWAY_MS = 1000
 const POLL_IDLE_MS = 5000
 const REPORT_WAIT_MS = 300
+const PV = 2
 
 /** @type {Info | null} */
 let info = null
@@ -35,15 +41,21 @@ let cwd = ''
 let interactive = false
 /** @type {{ cancel: () => void } | null} */
 let timer = null
+/** what the status line says now ('' = nothing), and the remote switch-on already shown as a toast */
+let shown = ''
+let toastedRemote = 0
+
+/** @param {unknown} p */
+const isAbs = (p) => typeof p === 'string' && (/^[A-Za-z]:[\\/]/.test(p) || /^\\\\[^\\/]+[\\/]/.test(p) || p.startsWith('/'))
 
 /** @param {Engine} $ @returns {Promise<Info | null>} */
 async function loadInfo($) {
   const own = await $.env.get('HINTY_AGENTS_HOME')
-  const base = own || `${(await $.env.get('USERPROFILE')) || (await $.env.get('HOME')) || ''}/.hinty-agents`
+  const base = own && isAbs(own) ? own : `${(await $.env.get('USERPROFILE')) || (await $.env.get('HOME')) || ''}/.hinty-agents`
   try {
     const d = JSON.parse(String(await $.fs.read(`${base}/daemon.json`)))
-    if (!Number.isInteger(d.port) || typeof d.secret !== 'string') return null
-    return { port: d.port, secret: d.secret }
+    if (d.pv !== PV || !Number.isInteger(d.port) || typeof d.key !== 'string' || d.key.length < 32) return null
+    return { port: d.port, key: d.key }
   } catch {
     return null
   }
@@ -52,14 +64,43 @@ async function loadInfo($) {
 /** @param {Engine} $ @param {Info} c @param {string} path @param {unknown} body */
 async function call($, c, path, body) {
   const n = nonce()
+  const ts = String(Date.now())
+  const text = JSON.stringify(body)
+  const auth = await hmacSha256Hex(c.key, `hinty-req\n${PV}\n${ts}\n${n}\nPOST\n${path}\n${await sha256Hex(text)}`)
   const res = await $.http.fetch(`http://127.0.0.1:${c.port}${path}`, {
     method: 'POST',
-    headers: { 'content-type': 'application/json', 'x-hinty-secret': c.secret, 'x-hinty-nonce': n },
-    body: JSON.stringify(body),
+    headers: { 'content-type': 'application/json', 'x-hinty-pv': String(PV), 'x-hinty-ts': ts, 'x-hinty-nonce': n, 'x-hinty-auth': auth },
+    body: text,
   })
   if (res.status !== 200) throw new Error(`http ${res.status}`)
-  if (res.headers['x-hinty-proof'] !== (await hmacSha256Hex(c.secret, `${n}\n${res.text}`))) throw new Error('proof')
+  const want = await hmacSha256Hex(c.key, `hinty-res\n${PV}\n${n}\n200\n${await sha256Hex(res.text)}`)
+  if (res.headers['x-hinty-sig'] !== want) throw new Error('signature')
   return JSON.parse(res.text)
+}
+
+/**
+ * Second layer of N12 (the service does it first): every line that starts with / ! # @ $ gets a zero-width space in
+ * front; control characters other than tab and newline, and direction marks, go. Idempotent.
+ * @param {string} text
+ */
+export function plain(text) {
+  return text.replace(/[\u0000-\u0008\u000b-\u001f\u007f-\u009f\u202a-\u202e\u2066-\u2069]/g, '')
+    .split('\n').map((l) => { const b = l.replace(/^\s+/u, ''); return b && '/!#@$'.includes(b[0]) ? `\u200b${b}` : l }).join('\n')
+}
+
+/** Status line + a toast for a remote switch-on. @param {Engine} $ @param {{ away?: unknown, remote?: unknown }} r */
+function showAway($, r) {
+  const remote = r.away === true && typeof r.remote === 'number' && r.remote > 0 ? r.remote : 0
+  const text = r.away === true ? `\u{1F453} Hinty away mode ON${remote ? ' (switched on remotely)' : ''}` : ''
+  try {
+    if (text !== shown) { shown = text; $.ui.status(text || undefined) }
+    if (remote && remote !== toastedRemote) {
+      toastedRemote = remote
+      const at = new Date(remote)
+      const hhmm = `${String(at.getHours()).padStart(2, '0')}:${String(at.getMinutes()).padStart(2, '0')}`
+      $.ui.toast(`Hinty: away mode was switched on remotely at ${hhmm}. At the desk: npx hinty-agents away off`, { timeoutMs: 15000 })
+    }
+  } catch { /* an older Claude Code without these: nothing to show */ }
 }
 
 /** Wait for `p` at most `ms` (a slow service never holds Claude Code up). @param {Engine} $ @param {Promise<unknown>} p @param {number} ms */
@@ -78,15 +119,17 @@ async function report($, body) {
   } catch {
     away = false
   }
+  if (!away) showAway($, { away })
 }
 
 /** @param {Engine} $ @param {Info} c @param {string} sid @param {unknown} cmd */
 function submit($, c, sid, cmd) {
   const o = /** @type {{ id?: unknown, text?: unknown }} */ (cmd || {})
   if (typeof o.id !== 'string' || typeof o.text !== 'string' || !o.text.trim()) return
+  const text = plain(o.text)
   const ack = (/** @type {boolean} */ ok) => call($, c, '/v1/mod/ack', { sid, id: o.id, ok }).catch(() => {})
-  $.ui.log(`Hinty glasses -> this session: ${o.text.slice(0, 80)}`, { to: 'debug' })
-  $.prompt.submit({ text: o.text, asUser: true }).then(() => ack(true), () => ack(false))
+  $.ui.log(`Hinty glasses -> this session: instruction ${o.id} (${text.length} characters)`, { to: 'debug' })
+  $.prompt.submit({ text, asUser: true }).then(() => ack(true), () => ack(false))
 }
 
 /** @param {Engine} $ */
@@ -95,15 +138,17 @@ async function tick($) {
   busy = true
   try {
     const c = info || (info = await loadInfo($))
-    if (!c) { away = false; pauseUntil = Date.now() + 10000; return }
+    if (!c) { away = false; showAway($, { away }); pauseUntil = Date.now() + 10000; return }
     const sid = await $.session.id()
     const r = await call($, c, '/v1/mod/poll', { sid, cwd, interactive, away, wait: 0 })
     away = r.away === true
+    showAway($, r)
     pauseUntil = Date.now() + (away ? POLL_AWAY_MS : POLL_IDLE_MS) - 50
     for (const cmd of Array.isArray(r.cmds) ? r.cmds : []) submit($, c, sid, cmd)
   } catch {
     info = null
     away = false
+    showAway($, { away })
     pauseUntil = Date.now() + 5000
   } finally {
     busy = false

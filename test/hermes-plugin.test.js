@@ -10,6 +10,7 @@ import path from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { createLocalServer, listenLoopback } from '../src/local-http.js'
 import { newSecret } from '../src/crypto.js'
+import { writeDaemon } from './helpers.js'
 import { Service } from '../src/service.js'
 import { HermesLink } from '../src/adapters/hermes.js'
 
@@ -43,7 +44,7 @@ async function bridge({ away = true, writeSecret } = {}) {
   if (away) service.setAway(true, 'test')
   const secret = newSecret()
   const server = createLocalServer({
-    secret,
+    key: secret,
     routes: {
       'POST /v1/hermes/perm': (b, c) => link.perm(b, c),
       'POST /v1/hermes/event': (b) => link.event(b),
@@ -52,7 +53,7 @@ async function bridge({ away = true, writeSecret } = {}) {
     },
   })
   const port = await listenLoopback(server)
-  fs.writeFileSync(path.join(home, 'daemon.json'), JSON.stringify({ v: 1, pid: process.pid, port, secret: writeSecret || secret }))
+  writeDaemon(home, { port, key: writeSecret || secret })
   return {
     home, sent, logs, service, link, of: (ev) => sent.filter((x) => x[0] === ev).map((x) => x[1]),
     async close() { service.stop(); server.close(); server.closeAllConnections?.() },
@@ -117,7 +118,7 @@ test('present N1: away off, no bridge, wrong secret (bad proof) and a request th
   const wrong = await bridge({ writeSecret: newSecret() })
   try {
     const r = await py(['present', 'once,deny'], wrong.home)
-    assert.match(r.error, /answered 401|bad proof/)
+    assert.match(r.error, /answered 401|bad signature/)
     assert.equal(wrong.of('perm').length, 0)
   } finally { await wrong.close() }
 

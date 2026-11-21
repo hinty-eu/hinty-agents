@@ -209,9 +209,10 @@ test('E3 errors: recognizer failure = failed, no text; over 35 s = too_long', as
   a.svc.stop()
   const b = setup()
   start(b.svc)
-  const big = Buffer.alloc(32000 * 10, 1)
-  for (let i = 0; i < 4; i++) b.svc.onRelay('audio', { uid: UID, seq: i, pcm: big })
-  assert.ok(4 * big.length > MAX_BYTES)
+  // frames of 1 s (32000 bytes, the contract's largest); since the security review frames over 64 KB are dropped
+  const big = Buffer.alloc(32000, 1)
+  for (let i = 0; i < 36; i++) b.svc.onRelay('audio', { uid: UID, seq: i, pcm: big })
+  assert.ok(36 * big.length > MAX_BYTES)
   assert.deepEqual(stts(b.relay), [{ uid: UID, text: '', fin: true, err: 'too_long' }])
   assert.equal(b.svc.voice.active, null)
   b.svc.stop()

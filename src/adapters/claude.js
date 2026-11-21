@@ -7,9 +7,9 @@
 // through the mod's $.prompt.submit (caps.say 'mod'). TODO (route 2, plan §4.2): when mods are disabled
 // (`disableAllHooks`, `allowManagedModsOnly`), hold the Stop hook in away mode and hand the instruction over as
 // `hookSpecificOutput.additionalContext` (not `decision: block`, which shows "Stop hook error"); limit 8 in a row.
-import { spawnSync } from 'node:child_process'
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
+import { resolveProgram, runSync } from '../exec.js'
 
 export const id = 'claude'
 export const PLUGIN = 'hinty-agents'
@@ -20,24 +20,19 @@ export const caps = { perm: 'prompt-only', say: 'mod' }
 export const repoRoot = () => path.resolve(fileURLToPath(new URL('../../', import.meta.url)))
 export const pluginDir = () => path.join(repoRoot(), 'claude-plugin')
 
-/** @param {string} a */
-const quoteWin = (a) => (/^[A-Za-z0-9_@%+=:,./\\-]+$/.test(a) ? a : `"${a.replace(/"/g, '\\"')}"`)
-
 /**
- * Run `claude` (always with DISABLE_AUTOUPDATER=1: an update interrupted mid-way breaks the CLI).
+ * Run `claude` (always with DISABLE_AUTOUPDATER=1: an update interrupted mid-way breaks the CLI). Found by our own PATH
+ * lookup (never the current folder) and started without a shell (security review point 6); an npm shim is mapped to
+ * what it starts. HINTY_AGENTS_CLAUDE = an absolute path of another `claude` (tests).
  * @param {string[]} args @param {{ timeoutMs?: number }} [o]
  * @returns {{ ok: boolean, code: number | null, stdout: string, stderr: string, missing: boolean }}
  */
 export function run(args, o = {}) {
-  const win = process.platform === 'win32'
-  const env = { ...process.env, DISABLE_AUTOUPDATER: '1' }
-  const r = win
-    ? spawnSync(['claude', ...args].map(quoteWin).join(' '), { shell: true, env, encoding: 'utf8', timeout: o.timeoutMs ?? 120000, windowsHide: true })
-    : spawnSync('claude', args, { env, encoding: 'utf8', timeout: o.timeoutMs ?? 120000 })
-  const stderr = String(r.stderr || '')
-  const missing = !!r.error && /** @type {any} */ (r.error).code === 'ENOENT' ||
-    (win && r.status !== 0 && /is not recognized|nie jest rozpoznawane/i.test(stderr))
-  return { ok: r.status === 0, code: r.status, stdout: String(r.stdout || ''), stderr, missing }
+  const launch = resolveProgram('claude', process.env.HINTY_AGENTS_CLAUDE)
+  if (!launch) return { ok: false, code: null, stdout: '', stderr: 'claude not found', missing: true }
+  const r = runSync(launch, args, { env: { DISABLE_AUTOUPDATER: '1' }, encoding: 'utf8', timeout: o.timeoutMs ?? 120000, stdio: ['ignore', 'pipe', 'pipe'] })
+  const missing = !!r.error && /** @type {any} */ (r.error).code === 'ENOENT'
+  return { ok: r.status === 0, code: r.status, stdout: String(r.stdout || ''), stderr: String(r.stderr || ''), missing }
 }
 
 /** @param {string} out */

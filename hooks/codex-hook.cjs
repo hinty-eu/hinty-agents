@@ -31,15 +31,17 @@ function hold(d, raw, print) {
 }
 
 function sessionStart(raw, dir) {
-  const cfg = readJson(dir + '/config.json')
+  const cfg = readJson(require('path').join(dir, 'config.json'))
   if (!cfg || typeof cfg.bridgeToken !== 'string' || cfg.bridgeToken.length < 16) return
   const finish = () => process.stdout.write(JSON.stringify({
     hookSpecificOutput: { hookEventName: 'SessionStart', additionalContext: CONTEXT },
   }))
+  let cwd = ''
+  try { cwd = String(JSON.parse(raw).cwd || '') } catch (e) { /* no cwd */ }
   const d = daemonInfo(dir)
-  if (!d) { autostart(cfg); finish(); return }
+  if (!d) { autostart(cfg, cwd); finish(); return }
   request(d, 'POST', ROUTES.SessionStart, raw, 1500, (ans) => {
-    if (!ans) autostart(cfg)
+    if (!ans) autostart(cfg, cwd)
     finish()
   })
 }

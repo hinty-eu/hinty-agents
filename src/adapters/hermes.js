@@ -10,7 +10,6 @@
 //   security.approval.transport_fallback  -> builtin   (set FIRST: no answer / no bridge = Hermes's normal prompt, N1)
 //   security.approval.transport           -> hinty
 //   plugins.entries.hinty-agents.allow_gateway_injection -> true   (needed for ctx.inject_message in a gateway)
-import { spawnSync } from 'node:child_process'
 import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
@@ -18,6 +17,7 @@ import { fileURLToPath } from 'node:url'
 import { homeDir, readJson, writeJson } from '../store.js'
 import { glassesLine } from '../text.js'
 import { SID_RE } from '../sessions.js'
+import { resolveProgram, runSync } from '../exec.js'
 
 export const id = 'hermes'
 export const caps = { perm: 'prompt-only', say: 'queue' }
@@ -33,18 +33,15 @@ export const hermesHome = () => process.env.HERMES_HOME
 export const pluginDir = () => path.join(hermesHome(), 'plugins', PLUGIN)
 export const backupFile = () => path.join(homeDir(), 'hermes', 'backup.json')
 
-/** HINTY_AGENTS_HERMES = path of the `hermes` executable (a .js/.mjs/.cjs is run with node); default `hermes` from PATH. */
-const bin = () => process.env.HINTY_AGENTS_HERMES || 'hermes'
-const quoteWin = (/** @type {string} */ p) => (/^[A-Za-z0-9_@%+=:,./\\-]+$/.test(p) ? p : `"${p.replace(/"/g, '\\"')}"`)
-
-/** @param {string[]} args @returns {{ status: number | null, stdout: string, stderr: string }} */
+/**
+ * `hermes` by our own PATH lookup (never the current folder), no shell; HINTY_AGENTS_HERMES = an absolute path of the
+ * executable (a .js/.mjs/.cjs is run with node).
+ * @param {string[]} args @returns {{ status: number | null, stdout: string, stderr: string }}
+ */
 function run(args) {
-  const b = bin()
-  const js = /\.(mjs|cjs|js)$/i.test(b)
-  const opt = { encoding: /** @type {const} */ ('utf8'), timeout: 300000, windowsHide: true, stdio: /** @type {any} */ (['ignore', 'pipe', 'pipe']), env: process.env }
-  const r = js ? spawnSync(process.execPath, [b, ...args], opt)
-    : process.platform === 'win32' ? spawnSync([b, ...args].map(quoteWin).join(' '), { ...opt, shell: true })
-      : spawnSync(b, args, opt)
+  const launch = resolveProgram('hermes', process.env.HINTY_AGENTS_HERMES)
+  if (!launch) return { status: null, stdout: '', stderr: 'hermes not found' }
+  const r = runSync(launch, args, { encoding: 'utf8', timeout: 300000, stdio: ['ignore', 'pipe', 'pipe'] })
   return { status: r.status, stdout: String(r.stdout || ''), stderr: String(r.stderr || '') }
 }
 
@@ -306,7 +303,7 @@ export class HermesLink {
     const tool = typeof body.pattern_key === 'string' && body.pattern_key ? body.pattern_key : 'terminal'
     const entry = { rid: '' }
     const answer = await this.service.requestPerm(
-      { sid, cwd: '', tool, input: { request_id: request, command, description }, agentId: null, agentType: '', cardText: `${description ? description + '\n' : ''}${command}`, label: 'hermes' },
+      { sid, cwd: '', tool, input: { request_id: request, command, description }, agentId: null, agentType: '', cardText: `${description ? description + '\n' : ''}${command}`, cardComplete: !!command.trim(), label: 'hermes' },
       ctl, { agent: 'hermes', ttlMs: Math.min(ttlS, 3600) * 1000, onCreate: (p) => { entry.rid = p.rid; if (request) this.pendingPerms.set(request, p.rid) } },
     )
     if (request) this.pendingPerms.delete(request)

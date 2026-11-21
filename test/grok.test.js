@@ -9,7 +9,7 @@ import path from 'node:path'
 import { fileURLToPath } from 'node:url'
 import * as grok from '../src/adapters/grok.js'
 import { activeAgents } from '../src/adapters/index.js'
-import { createLocalServer, listenLoopback } from '../src/local-http.js'
+import { fakeService } from './helpers.js'
 import { Service } from '../src/service.js'
 
 const HOOK = fileURLToPath(new URL('../hooks/grok-hook.cjs', import.meta.url))
@@ -72,8 +72,12 @@ test('normalize: camelCase input from the docs', () => {
 })
 
 test('isExcepted: harmless commands skip the card, chains and tricks do not', () => {
-  const ok = ['ls', 'ls -la', 'git status', 'git diff HEAD~1', 'pwd && ls', 'cat a.txt | head -5', 'echo hi']
-  const no = ['', 'rm -rf x', 'ls; rm x', 'ls && rm x', 'echo $(rm x)', 'echo `id`', 'cat a > b', 'lsof', 'git push', 'ls\nrm x', 'git statusx', 'echo ${HOME}', 'ls ||', 'cat <(id)']
+  // since the security review (point 9) chains are never excepted: `pwd && ls` and `cat a.txt | head -5` get a card
+  const ok = ['ls', 'ls -la', 'git status', 'git diff HEAD~1', 'echo hi', 'cat src/a.txt', 'git log --oneline -5']
+  const no = ['', 'rm -rf x', 'ls; rm x', 'ls && rm x', 'echo $(rm x)', 'echo `id`', 'cat a > b', 'lsof', 'git push', 'ls\nrm x', 'git statusx', 'echo ${HOME}', 'ls ||', 'cat <(id)',
+    'pwd && ls', 'cat a.txt | head -5', 'ls & rm -rf x', 'ls &', 'git diff --output=/tmp/x', 'git log -o x', 'git diff --ext-diff',
+    'npm test', 'npm run test', 'git branch -D main', 'cat /etc/passwd', 'cat ../x', 'cat ~/.hinty-agents/config.json',
+    'head C:\\Users\\me\\.ssh\\id_rsa', 'tail src/../../x', 'ls\u0007', 'echo "a"']
   for (const c of ok) assert.equal(grok.isExcepted(c), true, c)
   for (const c of no) assert.equal(grok.isExcepted(c), false, JSON.stringify(c))
   assert.equal(grok.isExcepted('make test', ['make test']), true, 'own list')
@@ -112,10 +116,7 @@ test('N1: no service = no output, exit 0 (Grok then runs the step: fail-open is 
 test('PreToolUse prints a veto only for {d:"deny"}: JSON on stdout, reason on stderr, exit 2', async () => {
   for (const [answer, veto] of [[{ d: 'deny' }, true], [{ d: 'allow' }, false], [{}, false], [{ d: 'maybe' }, false]]) {
     const dir = tmp('hinty-hook-')
-    const secret = 'k'.repeat(43)
-    const s = createLocalServer({ secret, routes: { 'POST /v1/hook/grok/pre-tool': () => answer } })
-    const port = await listenLoopback(s)
-    fs.writeFileSync(path.join(dir, 'daemon.json'), JSON.stringify({ v: 1, pid: 1, port, secret }))
+    const s = await fakeService(dir, { 'POST /v1/hook/grok/pre-tool': () => answer })
     const r = await runHook(dir, ['PreToolUse', '280'], PRE)
     s.close()
     if (veto) assert.deepEqual([r.code, r.stdout, r.stderr], [2, '{"decision":"deny","reason":"Denied from Hinty glasses"}', 'Denied from Hinty glasses'])

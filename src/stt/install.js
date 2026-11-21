@@ -2,7 +2,6 @@
 // `hinty-agents voice install|status|remove` (E3). `sherpa-onnx-node` (pinned) goes to ~/.hinty-agents/voice/ on
 // demand, never into this package's dependencies. Models go to ~/.hinty-agents/models/<id>/: downloaded to a
 // temporary file, size and sha256 checked, then renamed (a half-downloaded file is never taken for a model).
-import { spawnSync } from 'node:child_process'
 import crypto from 'node:crypto'
 import fs from 'node:fs'
 import { createRequire } from 'node:module'
@@ -10,6 +9,7 @@ import path from 'node:path'
 import { pipeline } from 'node:stream/promises'
 import { Readable, Transform } from 'node:stream'
 import { ensureHome, readJson, writeJson } from '../store.js'
+import { npmLaunch, runSync } from '../exec.js'
 import { DEFAULT_MODEL, MODELS, SHERPA_VERSION, VAD_MODEL, modelDir, modelsDir, voiceConfigFile, voiceDir } from './models.js'
 
 /** @typedef {{ v: 1, model: string, verifiedAt: string }} VoiceConfig */
@@ -93,7 +93,12 @@ export async function downloadFile(f, dir, onProgress) {
   const hash = crypto.createHash('sha256')
   let done = 0
   const meter = new Transform({
-    transform(chunk, _enc, cb) { hash.update(chunk); done += chunk.length; onProgress?.(done, f.size); cb(null, chunk) },
+    transform(chunk, _enc, cb) {
+      done += chunk.length
+      // a source that sends more than the model's size is cut off at once (it cannot fill the disk)
+      if (done > f.size) return cb(new Error(`download of ${f.name} is larger than expected (${f.size} bytes); stopped`))
+      hash.update(chunk); onProgress?.(done, f.size); cb(null, chunk)
+    },
   })
   try {
     await pipeline(Readable.fromWeb(/** @type {any} */ (res.body)), meter, fs.createWriteStream(tmp, { mode: 0o600 }))
@@ -111,8 +116,12 @@ function installSherpa() {
   fs.mkdirSync(voiceDir(), { recursive: true })
   const pj = path.join(voiceDir(), 'package.json')
   if (!fs.existsSync(pj)) fs.writeFileSync(pj, '{"name":"hinty-agents-voice","private":true,"version":"0.0.0"}\n')
-  const r = spawnSync('npm', ['install', '--prefix', voiceDir(), '--save-exact', `sherpa-onnx-node@${SHERPA_VERSION}`, '--no-audit', '--no-fund', '--loglevel=error'],
-    { stdio: 'inherit', shell: process.platform === 'win32', windowsHide: true })
+  // npm without a shell (security review points 6 and 11): node + npm-cli.js, the folder as one argument (a space in
+  // the user name no longer splits it, a `&` is not run by cmd.exe), started in the voice folder
+  const npm = npmLaunch()
+  if (!npm) throw new Error('npm was not found next to this Node.js or on PATH')
+  const r = runSync(npm, ['install', '--prefix', voiceDir(), '--save-exact', `sherpa-onnx-node@${SHERPA_VERSION}`, '--no-audit', '--no-fund', '--loglevel=error'],
+    { stdio: 'inherit', cwd: voiceDir() })
   if (r.status !== 0 || !sherpaInstalled()) throw new Error('npm could not install sherpa-onnx-node (see the message above)')
 }
 

@@ -1,7 +1,10 @@
 """Hinty Agents plugin for Hermes Agent (hinty-agents-marker).
 
-Standard library only. It talks to the Hinty Agents bridge on 127.0.0.1 (port and secret from
-$HINTY_AGENTS_HOME/daemon.json, every answer carries an HMAC proof), and nowhere else.
+Standard library only. It talks to the Hinty Agents bridge on 127.0.0.1 (port and key from
+$HINTY_AGENTS_HOME/daemon.json; the variable only counts when it is an absolute path), and nowhere else.
+Local protocol v2 (src/localauth.js in the bridge): every request is signed with the key, which never travels, and
+an answer counts only with the bridge's signature over our nonce, the status and the body. Another protocol version
+in daemon.json = no bridge (N1).
 
 What it does
   * approval transport "hinty": an approval prompt goes to the bridge, which shows it on the glasses / panel while the
@@ -18,6 +21,7 @@ import http.client
 import json
 import os
 import queue
+import re
 import secrets
 import threading
 import time
@@ -32,39 +36,65 @@ _EVENTS = queue.Queue(maxsize=200)
 _STARTED = False
 
 
+PV = 2
+
+
+def _is_abs(p):
+    if not isinstance(p, str) or not p or "\0" in p:
+        return False
+    if os.name == "nt":
+        return bool(re.match(r"^[A-Za-z]:[\\/]", p) or re.match(r"^\\\\[^\\/]+[\\/]", p))
+    return p.startswith("/")
+
+
 def _home():
-    return os.environ.get("HINTY_AGENTS_HOME") or os.path.join(os.path.expanduser("~"), ".hinty-agents")
+    own = os.environ.get("HINTY_AGENTS_HOME")
+    if own and _is_abs(own):
+        return own
+    return os.path.join(os.path.expanduser("~"), ".hinty-agents")
 
 
 def _daemon():
     try:
         with open(os.path.join(_home(), "daemon.json"), encoding="utf-8") as f:
             d = json.load(f)
-        return int(d["port"]), str(d["secret"])
+        if d.get("pv") != PV or not isinstance(d.get("key"), str) or len(d["key"]) < 32:
+            return None
+        port = d.get("port")
+        if not isinstance(port, int) or not 0 < port < 65536:
+            return None
+        return port, d["key"]
     except Exception:
         return None
 
 
+def _mac(key, msg):
+    return hmac.new(key.encode("utf-8"), msg.encode("utf-8"), hashlib.sha256).hexdigest()
+
+
 def _post(path, body, timeout):
-    """POST json to the bridge; raises on anything unexpected (no bridge, bad proof, bad status)."""
+    """POST json to the bridge; raises on anything unexpected (no bridge, bad signature, bad status)."""
     info = _daemon()
     if not info:
         raise RuntimeError("hinty: the bridge is not running")
-    port, secret = info
+    port, key = info
     nonce = secrets.token_hex(16)
+    ts = str(int(time.time() * 1000))
     data = json.dumps(body).encode("utf-8")
+    auth = _mac(key, "hinty-req\n%d\n%s\n%s\nPOST\n%s\n%s" % (PV, ts, nonce, path, hashlib.sha256(data).hexdigest()))
     conn = http.client.HTTPConnection("127.0.0.1", port, timeout=timeout)
     try:
         conn.request("POST", path, body=data, headers={
-            "content-type": "application/json", "x-hinty-secret": secret, "x-hinty-nonce": nonce,
-            "connection": "close"})
+            "content-type": "application/json", "x-hinty-pv": str(PV), "x-hinty-ts": ts, "x-hinty-nonce": nonce,
+            "x-hinty-auth": auth, "connection": "close"})
         res = conn.getresponse()
-        text = res.read().decode("utf-8")
+        raw = res.read()
         if res.status != 200:
             raise RuntimeError("hinty: bridge answered %s" % res.status)
-        want = hmac.new(secret.encode("utf-8"), (nonce + "\n" + text).encode("utf-8"), hashlib.sha256).hexdigest()
-        if not hmac.compare_digest(want, res.getheader("x-hinty-proof") or ""):
-            raise RuntimeError("hinty: bad proof from the bridge")
+        want = _mac(key, "hinty-res\n%d\n%s\n200\n%s" % (PV, nonce, hashlib.sha256(raw).hexdigest()))
+        if not hmac.compare_digest(want, res.getheader("x-hinty-sig") or ""):
+            raise RuntimeError("hinty: bad signature from the bridge")
+        text = raw.decode("utf-8")
         return json.loads(text) if text else {}
     finally:
         conn.close()
@@ -185,7 +215,8 @@ def _poller(ctx):
             r = _post("/v1/hermes/poll", {"wait": 20, "can_say": hasattr(ctx, "inject_message")}, 35.0)
             cmds = r.get("cmds") or []
             for c in cmds:
-                text = str(c.get("text") or "")
+                # control characters (other than tab / newline) and direction marks never reach Hermes
+                text = re.sub(r"[\x00-\x08\x0b-\x1f\x7f-\x9f\u202a-\u202e\u2066-\u2069]", "", str(c.get("text") or ""))
                 ok = False
                 # The bridge already neutralises "/" and "!"; refuse anything that still looks like a command.
                 if text.strip() and text.lstrip()[:1] not in ("/", "!"):

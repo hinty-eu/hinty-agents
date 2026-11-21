@@ -1,6 +1,7 @@
 // @ts-check
 // HMAC-SHA-256 for the mod. The mod's environment offers only `crypto.subtle.digest`, so HMAC is built from it
-// (RFC 2104). Used to check the local service's proof on every answer.
+// (RFC 2104). Used to sign every request to the local service and to check the service's signature on every answer
+// (local protocol v2, src/localauth.js).
 
 const enc = new TextEncoder()
 
@@ -28,6 +29,11 @@ export async function hmacSha256Hex(secret, message) {
   for (let i = 0; i < 64; i++) outer[i] = (k[i] ?? 0) ^ 0x5c
   outer.set(innerHash, 64)
   return hex(await sha256(outer))
+}
+
+/** SHA-256 of a text's UTF-8 bytes, lower-case hex. @param {string} text */
+export async function sha256Hex(text) {
+  return hex(await sha256(enc.encode(text)))
 }
 
 /** 128-bit random nonce, hex. */

@@ -6,11 +6,24 @@ import os from 'node:os'
 import path from 'node:path'
 import { spawnSync } from 'node:child_process'
 import { fileURLToPath } from 'node:url'
+import { isAbsPath, sysExe } from './exec.js'
+import { PV } from './localauth.js'
 
 export const DEFAULT_API = 'https://api.v1.hinty.eu'
 
+let warnedHome = false
+/**
+ * The data folder: $HINTY_AGENTS_HOME when it is an ABSOLUTE path, else ~/.hinty-agents. A relative value (which would
+ * point into whatever folder a command runs in, e.g. a repository) is ignored with a warning (security review point 8).
+ */
 export function homeDir() {
-  return process.env.HINTY_AGENTS_HOME || path.join(os.homedir(), '.hinty-agents')
+  const own = process.env.HINTY_AGENTS_HOME
+  if (own && isAbsPath(own)) return own
+  if (own && !warnedHome) {
+    warnedHome = true
+    process.emitWarning('HINTY_AGENTS_HOME is not an absolute path; it is ignored and ~/.hinty-agents is used', { code: 'HINTY_AGENTS_HOME' })
+  }
+  return path.join(os.homedir(), '.hinty-agents')
 }
 
 export const paths = () => {
@@ -42,8 +55,8 @@ export function restrictWindowsAcl(dir) {
   const user = process.env.USERNAME
   if (!user) return false
   const who = process.env.USERDOMAIN ? `${process.env.USERDOMAIN}\\${user}` : user
-  const r = spawnSync('icacls', [dir, '/inheritance:r', '/grant:r', `${who}:(OI)(CI)F`, '/grant:r', '*S-1-5-18:(OI)(CI)F'],
-    { stdio: 'ignore', windowsHide: true, timeout: 10000 })
+  const r = spawnSync(sysExe('icacls.exe'), [dir, '/inheritance:r', '/grant:r', `${who}:(OI)(CI)F`, '/grant:r', '*S-1-5-18:(OI)(CI)F'],
+    { stdio: 'ignore', windowsHide: true, timeout: 10000, cwd: os.homedir() })
   return r.status === 0
 }
 
@@ -66,7 +79,10 @@ export function writeJson(file, obj) {
 
 /**
  * @typedef {{ v: 1, api: string, bridgeToken?: string, bridgeId?: string, label?: string, host?: string,
- *   pairedAt?: string, entry?: string, stopped?: boolean, autostart?: boolean }} Config
+ *   pairedAt?: string, entry?: string, stopped?: boolean, autostart?: boolean, account?: string,
+ *   remoteAwayOn?: boolean, notify?: boolean }} Config
+ * `remoteAwayOn`: the person agreed (wizard or `remote-away on`) that the Hinty panel / glasses may switch away mode ON;
+ * absent or false = only this computer switches it on (switching it off remotely always works).
  */
 
 /** @returns {Config | null} */
@@ -84,13 +100,23 @@ export function updateConfig(patch) {
 /** @param {Config | null} c */
 export const isPaired = (c) => !!(c && typeof c.bridgeToken === 'string' && c.bridgeToken.length >= 16)
 
-/** @typedef {{ v: 1, pid: number, port: number, secret: string, startedAt: string, version: string }} DaemonInfo */
+/** @typedef {{ v: 2, pv: 2, pid: number, port: number, key: string, startedAt: string, version: string }} DaemonInfo */
+
+/** @param {any} d @returns {d is DaemonInfo} daemon.json of the local protocol this version speaks (v2) */
+export const isDaemonInfo = (d) => !!d && d.pv === PV && Number.isInteger(d.port) && d.port > 0 && d.port <= 65535 &&
+  typeof d.key === 'string' && d.key.length >= 32 && Number.isInteger(d.pid)
 
 /** @returns {DaemonInfo | null} */
 export function readDaemonInfo() {
   const d = readJson(paths().daemon)
-  if (!d || !Number.isInteger(d.port) || typeof d.secret !== 'string') return null
-  return d
+  return isDaemonInfo(d) ? d : null
+}
+
+/** daemon.json as it is, also of another version (an older service still running): `{pid, old}` or null. */
+export function readDaemonAny() {
+  const d = readJson(paths().daemon)
+  if (!d || !Number.isInteger(d.pid)) return null
+  return { pid: /** @type {number} */ (d.pid), old: !isDaemonInfo(d), info: isDaemonInfo(d) ? d : null }
 }
 
 /** @param {number} pid */

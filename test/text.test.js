@@ -17,13 +17,15 @@ test('glasses line fallback: first sentence, masked', () => {
 })
 
 test('permission text: Bash command and description, masked, no control characters, <= 8000', () => {
-  const t = permText('Bash', { command: 'curl -H "Authorization: Bearer abcdefgh12345"\x07 x', description: 'call api' })
+  // permText returns {text, complete} since the security review (point 3); masked or cleaned = not complete
+  const { text: t, complete } = permText('Bash', { command: 'curl -H "Authorization: Bearer abcdefgh12345"\x07 x', description: 'call api' })
   assert.ok(t.startsWith('curl -H "Authorization: Bearer ***"'))
   assert.ok(t.includes('# call api'))
   assert.ok(!/[\x00-\x08\x0b\x0c\x0e-\x1f]/.test(t))
-  assert.ok(permText('Write', { file_path: 'a.txt', content: 'x'.repeat(20000) }).length <= 8000)
+  assert.equal(complete, false)
+  assert.ok(permText('Write', { file_path: 'a.txt', content: 'x'.repeat(20000) }).text.length <= 8000)
   assert.ok(relayText('😀'.repeat(5000)).length <= 8000)
-  assert.equal(permText('mcp__x__y', null), 'null')
+  assert.deepEqual(permText('mcp__x__y', null), { text: 'null', complete: false })
 })
 
 test('oneLine: no newlines, cut by code points', () => {

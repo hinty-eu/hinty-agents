@@ -194,17 +194,18 @@ class TapSocket extends EventEmitter {
 }
 TapSocket.local = new Set(['connect', 'disconnect', 'connect_error'])
 
-function wired() {
+function wired(o = {}) {
   const sock = new TapSocket()
   const relay = new Relay({ api: 'http://127.0.0.1:9', token: 't'.repeat(32), io: () => sock })
-  const svc = new Service({ relay: { get connected() { return relay.connected }, emit: (e, p) => relay.send(e, p) }, sessDebounceMs: 0 })
+  const svc = new Service({ relay: { get connected() { return relay.connected }, emit: (e, p) => relay.send(e, p) }, sessDebounceMs: 0, ...o })
   relay.on('relay', (ev, p) => svc.onRelay(ev, p))
   relay.start()
   return { sock, relay, svc }
 }
 
 test('N5: with away mode off the socket carries only hello/away, never sess, perm or msg', async () => {
-  const { sock, relay, svc } = wired()
+  // this test switches away mode on from the relay, so the person has agreed to that here (remoteAwayOn)
+  const { sock, relay, svc } = wired({ remoteAwayAllowed: () => true })
   sock.serverSends('ready', { v: 1, bridgeId: 'a'.repeat(24), label: 'pc' })
   const t0 = Date.now()
   assert.deepEqual(await svc.hookPermission(input()), {})

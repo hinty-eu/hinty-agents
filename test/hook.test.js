@@ -8,7 +8,7 @@ import http from 'node:http'
 import os from 'node:os'
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
-import { createLocalServer, listenLoopback } from '../src/local-http.js'
+import { fakeService as fake, writeDaemon } from './helpers.js'
 
 const HOOK = fileURLToPath(new URL('../claude-plugin/hook.cjs', import.meta.url))
 const ALLOW = '{"hookSpecificOutput":{"hookEventName":"PermissionRequest","decision":{"behavior":"allow"}}}'
@@ -35,21 +35,18 @@ function runHook(dir, event = 'PermissionRequest', input = INPUT) {
 }
 
 /** a fake service that answers the permission route with `answer` */
-async function fakeService(dir, answer, secret = 'k'.repeat(43)) {
-  const s = createLocalServer({ secret, routes: {
+function fakeService(dir, answer, o = {}) {
+  return fake(dir, {
     'POST /v1/hook/permission': () => answer,
     'POST /v1/hook/session-start': () => ({ ok: true }),
-  } })
-  const port = await listenLoopback(s)
-  fs.writeFileSync(path.join(dir, 'daemon.json'), JSON.stringify({ v: 1, pid: process.pid, port, secret }))
-  return s
+  }, o)
 }
 
 test('N1: no service file, a dead port, garbage in daemon.json = no output, exit 0', async () => {
   const dir = home()
   let r = await runHook(dir)
   assert.deepEqual([r.code, r.stdout, r.stderr], [0, '', ''])
-  fs.writeFileSync(path.join(dir, 'daemon.json'), JSON.stringify({ v: 1, pid: 1, port: 9, secret: 'x' }))
+  writeDaemon(dir, { pid: 1, port: 9, key: 'x'.repeat(43) })
   r = await runHook(dir)
   assert.deepEqual([r.code, r.stdout], [0, ''])
   fs.writeFileSync(path.join(dir, 'daemon.json'), '{not json')
@@ -79,19 +76,17 @@ test('N1/N2: only {d:"allow"} and {d:"deny"} print, always the fixed JSON (extra
   }
 })
 
-test('N1: an answer without the service\'s proof (a process squatting the port) is ignored', async () => {
+test('N1: an answer without the service\'s signature (a process squatting the port) is ignored', async () => {
   const dir = home()
   const squat = http.createServer((req, res) => { req.resume(); res.end('{"d":"allow"}') })
   await new Promise((r) => squat.listen(0, '127.0.0.1', r))
-  fs.writeFileSync(path.join(dir, 'daemon.json'), JSON.stringify({ v: 1, pid: 1, port: squat.address().port, secret: 'k'.repeat(43) }))
+  writeDaemon(dir, { pid: 1, port: squat.address().port, key: 'k'.repeat(43) })
   const r = await runHook(dir)
   squat.close()
   assert.deepEqual([r.code, r.stdout], [0, ''])
-  // a service with another secret than the one in daemon.json: same
+  // a service with another key than the one in daemon.json: it refuses the request (401), the hook prints nothing
   const dir2 = home()
-  const s = await fakeService(dir2, { d: 'allow' }, 'a'.repeat(43))
-  const info = JSON.parse(fs.readFileSync(path.join(dir2, 'daemon.json'), 'utf8'))
-  fs.writeFileSync(path.join(dir2, 'daemon.json'), JSON.stringify({ ...info, secret: 'b'.repeat(43) }))
+  const s = await fakeService(dir2, { d: 'allow' }, { key: 'a'.repeat(43), writeKey: 'b'.repeat(43) })
   assert.equal((await runHook(dir2)).stdout, '')
   s.close()
 })

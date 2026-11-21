@@ -5,11 +5,13 @@
 // decided from the glasses/panel (allow|deny), answered at the keyboard (`local`), expired, refused by the relay,
 // cancelled (the hook went away), or released (away turned off, link lost, service stopping).
 // Only `decided` ends with a decision for the hook; every other end gives the hook an empty result (N1, D8).
+// A request whose card does not show everything that will run (`part`, security review point 3) can be denied
+// remotely but never allowed: "allow" for it is refused here, whatever the relay says.
 import { newRid, permHash, safeEqual } from './crypto.js'
 
 /**
  * @typedef {{ rid: string, hash: string, sid: string, agentKey: string, tool: string, text: string,
- *   createdAt: number, expiresAt: number }} Perm
+ *   createdAt: number, expiresAt: number, part: boolean }} Perm
  * @typedef {{ ok: true, perm: Perm, d: 'allow' | 'deny' } | { ok: false, reason: string }} DecideResult
  */
 
@@ -26,7 +28,7 @@ export class PermTable {
   }
 
   /**
-   * @param {{ sid: string, agentId?: string | null, tool: string, input: unknown, text: string, ttlMs: number }} p
+   * @param {{ sid: string, agentId?: string | null, tool: string, input: unknown, text: string, ttlMs: number, part?: boolean }} p
    * @returns {Perm}
    */
   create(p) {
@@ -42,6 +44,7 @@ export class PermTable {
       text: p.text,
       createdAt: now,
       expiresAt: now + p.ttlMs,
+      part: p.part === true,
     }
     this.pending.set(rid, perm)
     return perm
@@ -70,6 +73,8 @@ export class PermTable {
       return { ok: false, reason: 'expired' }
     }
     if (!safeEqual(hash, perm.hash)) return { ok: false, reason: 'bad_hash' }
+    // the card was cut, masked or summarised: only the terminal can allow it (the request keeps waiting)
+    if (d === 'allow' && perm.part) return { ok: false, reason: 'partial' }
     this.finish(rid)
     return { ok: true, perm, d }
   }

@@ -3,12 +3,16 @@
 import { spawn, spawnSync } from 'node:child_process'
 import fs from 'node:fs'
 import os from 'node:os'
-import { call, status as daemonStatus } from './client.js'
+import readline from 'node:readline'
+import { call, pingOwn, status as daemonStatus } from './client.js'
 import * as claude from './adapters/claude.js'
 import { ADAPTERS, get as getAdapter } from './adapters/index.js'
+import { childEnv, hardenEnv, isOurDaemonLine, processCommandLine, sysExe } from './exec.js'
+import { hhmm } from './notify.js'
 import { prettyCode, pair } from './pair.js'
 import { Relay } from './relay.js'
-import { DEFAULT_API, cliEntry, ensureHome, isPaired, paths, pidAlive, readConfig, readDaemonInfo, updateConfig } from './store.js'
+import { DEFAULT_API, cliEntry, ensureHome, isPaired, paths, pidAlive, readConfig, readDaemonAny, readDaemonInfo, updateConfig } from './store.js'
+import { oneLine } from './text.js'
 import { MODELS } from './stt/models.js'
 import { fmtMB, installVoice, removeVoice, voiceStatus } from './stt/install.js'
 import { VERSION } from './version.js'
@@ -32,6 +36,7 @@ Usage: npx hinty-agents [command]
   (no command)        set up: pair this computer, install the Claude Code plugin, start the service
   status              what runs, the link, away mode, known sessions
   away on|off         away-from-desk mode: while off nothing leaves this computer (it turns itself off after 12 h)
+  remote-away on|off  allow (or not) switching away mode ON remotely from the Hinty panel or glasses (default off)
   install <agent>     claude: the plugin (hooks + mod) via Claude Code's plugin commands
                       codex: hooks merged into $CODEX_HOME/hooks.json (then trust them once: /hooks in Codex)
                       grok: ~/.grok/hooks/hinty.json; add --ask-shell to get a card for every shell command
@@ -49,7 +54,18 @@ Server: ${DEFAULT_API} (override with HINTY_AGENTS_API). Data: ~/.hinty-agents (
 
 /** @param {string[]} argv @returns {Promise<number>} */
 export async function main(argv) {
+  // never run a program from the current folder (security review point 6)
+  hardenEnv()
   const [cmd, ...rest] = argv
+  try {
+    return await dispatch(cmd, rest, argv)
+  } finally {
+    closeInput()
+  }
+}
+
+/** @param {string | undefined} cmd @param {string[]} rest @param {string[]} argv @returns {Promise<number>} */
+async function dispatch(cmd, rest, argv) {
   switch (cmd) {
     case undefined:
     case 'setup':
@@ -61,6 +77,7 @@ export async function main(argv) {
     }
     case 'status': return showStatus()
     case 'away': return away(rest[0])
+    case 'remote-away': return remoteAwayCmd(rest[0])
     case 'install': return installCmd(rest[0], rest.slice(1))
     case 'uninstall': return uninstallCmd(rest[0])
     case 'doctor': return doctor()
@@ -91,9 +108,75 @@ function apiFor(/** @type {import('./store.js').Config | null} */ cfg) {
 }
 
 function panelUrl(/** @type {string} */ api) {
-  if (process.env.HINTY_AGENTS_WEB) return process.env.HINTY_AGENTS_WEB
+  if (process.env.HINTY_AGENTS_WEB) return oneLine(process.env.HINTY_AGENTS_WEB, 200)
   return api === DEFAULT_API ? 'https://www.hinty.eu/dashboard/voice-assistant/agents' : null
 }
+
+// ------------------------------------------------------------------------------------------------
+// Questions (one line from stdin, a terminal or a pipe; end of input = the default answer)
+// ------------------------------------------------------------------------------------------------
+
+/** @type {readline.Interface | null} */
+let rl = null
+/** @type {string[]} */
+const lines = []
+/** @type {Array<(l: string) => void>} */
+const waiting = []
+let inputClosed = false
+
+/** @param {string} question @returns {Promise<string>} */
+export function ask(question) {
+  process.stdout.write(question)
+  if (lines.length) return Promise.resolve(/** @type {string} */ (lines.shift()))
+  if (inputClosed) { process.stdout.write('\n'); return Promise.resolve('') }
+  if (!rl) {
+    rl = readline.createInterface({ input: process.stdin, terminal: false })
+    rl.on('line', (l) => { const w = waiting.shift(); if (w) w(l); else lines.push(l) })
+    rl.on('close', () => { inputClosed = true; for (const w of waiting.splice(0)) w('') })
+  }
+  return new Promise((resolve) => waiting.push(resolve))
+}
+
+/** @param {string} question @returns {Promise<boolean>} only y / yes counts */
+export async function askYes(question) {
+  return /^\s*(y|yes)\s*$/i.test(await ask(question))
+}
+
+function closeInput() {
+  if (rl) { rl.close(); rl = null }
+}
+
+/** Is a service of ANOTHER version running (daemon.json of an older protocol, its pid our service)? */
+function olderServicePid() {
+  const any = readDaemonAny()
+  if (!any || !any.old || !pidAlive(any.pid)) return 0
+  return isOurDaemonLine(processCommandLine(any.pid)) ? any.pid : 0
+}
+
+/** The server may tell this bridge "unpaired" (a token it gave us that we do not keep). @param {string} api @param {string} token */
+function tellServerUnpair(api, token) {
+  const relay = new Relay({ api, token })
+  return new Promise((resolve) => {
+    const t = setTimeout(() => { relay.stop(); resolve(false) }, 8000)
+    relay.on('relay', (ev) => {
+      if (ev === 'ready') { relay.send('unpair'); setTimeout(() => { clearTimeout(t); relay.stop(); resolve(true) }, 800) }
+      if (ev === 'invalid_token') { clearTimeout(t); relay.stop(); resolve(true) }
+    })
+    relay.start()
+  })
+}
+
+const REMOTE_AWAY_TEXT = [
+  'Away mode is what lets your glasses and the Hinty panel answer permission prompts and send instructions to your',
+  'agents. You can always switch it on here: npx hinty-agents away on',
+  '',
+  'You can also allow switching it ON remotely (from the Hinty panel or your glasses).',
+  'Risk: whoever gets into your Hinty account (or the Hinty server) could then switch it on while you are not at',
+  'the desk and, with an agent session open, send it instructions and approve its steps on this computer.',
+  'A remote switch-on is shown here (status line in Claude Code, a notification, `npx hinty-agents status`), it never',
+  'extends the 12 hours, and switching away mode OFF remotely always works.',
+  'Change it any time: npx hinty-agents remote-away on|off',
+]
 
 // ------------------------------------------------------------------------------------------------
 // Service lifecycle
@@ -104,7 +187,9 @@ export async function startDaemon() {
   updateConfig({ stopped: false, entry: cliEntry() })
   const now = await daemonStatus()
   if (now) return now
-  const child = spawn(process.execPath, [cliEntry(), 'daemon'], { detached: true, stdio: 'ignore', windowsHide: true, env: process.env })
+  if (olderServicePid()) return null
+  // started in the data folder, never in the folder this command runs in
+  const child = spawn(process.execPath, [cliEntry(), 'daemon'], { detached: true, stdio: 'ignore', windowsHide: true, env: childEnv(), cwd: paths().home })
   child.unref()
   for (let i = 0; i < 80; i++) {
     await sleep(100)
@@ -117,26 +202,47 @@ export async function startDaemon() {
 async function start() {
   const cfg = readConfig()
   if (!isPaired(cfg)) { out('Not paired yet. Run: npx hinty-agents'); return 1 }
+  const old = olderServicePid()
+  if (old) { out(c.warn(`An older version of the service is running (pid ${old}). Stop it first: npx hinty-agents stop`)); return 1 }
   const s = await startDaemon()
   if (!s) { out(c.bad('The service did not start. See ' + paths().log)); return 1 }
   out(`${c.ok('✓')} Service running (pid ${s.pid}).`)
   return 0
 }
 
+/**
+ * Stop the service. Security review point 7: the pid in daemon.json is killed only when it is our service (a signed
+ * answer with the same pid, or the command line `node .../hinty-agents.js daemon`). After a reboot that pid may
+ * belong to any other program: then only the stale files are removed.
+ */
 async function stop() {
   if (readConfig()) updateConfig({ stopped: true })
-  const info = readDaemonInfo()
-  if (!info) { out('The service is not running.'); return 0 }
-  try { await call('POST', '/v1/stop') } catch { /* not answering */ }
-  for (let i = 0; i < 40 && pidAlive(info.pid); i++) await sleep(100)
-  if (pidAlive(info.pid)) {
-    if (process.platform === 'win32') spawnSync('taskkill', ['/PID', String(info.pid), '/T', '/F'], { stdio: 'ignore', windowsHide: true })
-    else { try { process.kill(info.pid, 'SIGTERM') } catch { /* gone */ } }
+  const any = readDaemonAny()
+  const removeFiles = () => {
+    try { fs.unlinkSync(paths().daemon) } catch { /* gone */ }
+    try { const l = Number(fs.readFileSync(paths().lock, 'utf8')); if (!pidAlive(l) || (any && l === any.pid)) fs.unlinkSync(paths().lock) } catch { /* gone */ }
+  }
+  if (!any) { out('The service is not running.'); return 0 }
+  const pid = any.pid
+  const signed = !!any.info && await pingOwn(any.info)
+  const ours = pidAlive(pid) && (signed || isOurDaemonLine(processCommandLine(pid)))
+  if (!ours) {
+    removeFiles()
+    out(pidAlive(pid)
+      ? `The service is not running (its old pid ${pid} now belongs to another program, which was left alone).`
+      : 'The service is not running.')
+    return 0
+  }
+  if (signed) { try { await call('POST', '/v1/stop') } catch { /* not answering */ } }
+  for (let i = 0; i < 40 && pidAlive(pid); i++) await sleep(100)
+  if (pidAlive(pid)) {
+    if (process.platform === 'win32') spawnSync(sysExe('taskkill.exe'), ['/PID', String(pid), '/T', '/F'], { stdio: 'ignore', windowsHide: true, cwd: os.homedir() })
+    else { try { process.kill(pid, 'SIGTERM') } catch { /* gone */ } }
     await sleep(300)
   }
-  for (const f of [paths().daemon, paths().lock]) { try { if (!pidAlive(info.pid)) fs.unlinkSync(f) } catch { /* gone */ } }
-  out(pidAlive(info.pid) ? c.bad(`The service (pid ${info.pid}) is still running.`) : `${c.ok('✓')} Service stopped. It will not start again until \`npx hinty-agents start\`.`)
-  return pidAlive(info.pid) ? 1 : 0
+  if (!pidAlive(pid)) removeFiles()
+  out(pidAlive(pid) ? c.bad(`The service (pid ${pid}) is still running.`) : `${c.ok('✓')} Service stopped. It will not start again until \`npx hinty-agents start\`.`)
+  return pidAlive(pid) ? 1 : 0
 }
 
 // ------------------------------------------------------------------------------------------------
@@ -162,9 +268,10 @@ async function setup(args) {
   ensureHome()
   let cfg = readConfig()
   if (isPaired(cfg) && cfg) {
-    out(`${c.ok('✓')} Already paired with ${cfg.api} as "${cfg.label || '?'}" (to pair again: npx hinty-agents unpair)`)
+    out(`${c.ok('✓')} Already paired with ${cfg.api} as "${oneLine(cfg.label || '?', 60)}"${cfg.account ? ` (account ${cfg.account})` : ''} (to pair again: npx hinty-agents unpair)`)
   } else {
     const api = apiFor(null)
+    if (!checkApi(api)) return 1
     out(`\nPairing with ${api} ...`)
     let res
     try {
@@ -189,8 +296,34 @@ async function setup(args) {
       out(c.bad(`\n✗ Pairing failed: ${why}`))
       return 1
     }
-    cfg = updateConfig({ api, bridgeToken: res.token, bridgeId: res.bridgeId, label, host: os.hostname(), pairedAt: new Date().toISOString(), entry: cliEntry() })
+    // security review point 4: whoever typed the code now steers this computer, so the person confirms the account
+    out('')
+    let yes
+    if (res.account) {
+      out(`  The code was entered by the Hinty account  ${c.b(res.account)}`)
+      yes = await askYes('  Is this your account? [y/N] ')
+    } else {
+      out(c.warn('  ! The server did not say which account entered the code.'))
+      out('    Open the Hinty panel (Voice Assistant -> Agents) and verify that this computer appears on YOUR account.')
+      yes = await askYes('  Is this computer listed on your own account? [y/N] ')
+    }
+    if (!yes) {
+      const told = await tellServerUnpair(api, res.token)
+      out(c.bad(`\n✗ Not confirmed: this computer was ${told ? 'disconnected from that account again' : 'not kept; remove it in the Hinty panel too (the server was not reached)'}. Nothing was saved.`))
+      return 1
+    }
+    cfg = updateConfig({ api, bridgeToken: res.token, bridgeId: res.bridgeId, label, host: os.hostname(), pairedAt: new Date().toISOString(), entry: cliEntry(), ...(res.account ? { account: res.account } : {}) })
     out(`${c.ok('✓')} Paired. The token is in ${paths().config} (readable by you only).`)
+  }
+
+  // asked once: may the Hinty panel / glasses switch away mode ON? (security review point 2; default no)
+  if (cfg.remoteAwayOn === undefined) {
+    out('')
+    out(c.b('Remote switch-on of away mode'))
+    for (const l of REMOTE_AWAY_TEXT) out(`  ${l}`)
+    const allow = await askYes('Allow switching away mode ON remotely? [y/N] ')
+    cfg = updateConfig({ remoteAwayOn: allow })
+    out(allow ? `${c.ok('✓')} Remote switch-on allowed.` : `${c.ok('✓')} Remote switch-on NOT allowed: only this computer switches away mode on.`)
   }
 
   if (!noInstall) {
@@ -214,7 +347,7 @@ async function setup(args) {
 
   out('')
   out(c.b('Away mode is OFF: nothing about your sessions leaves this computer.'))
-  out('When you leave the desk:  npx hinty-agents away on   (or switch it on in the Hinty panel)')
+  out(`When you leave the desk:  npx hinty-agents away on${cfg.remoteAwayOn === true ? '   (or switch it on in the Hinty panel)' : ''}`)
   out('It turns itself off after 12 hours. Back at the desk:  npx hinty-agents away off')
   out('New Claude Code sessions pick the plugin up; restart the ones already open.')
   return 0
@@ -228,18 +361,66 @@ async function showStatus() {
   const cfg = readConfig()
   out(c.b(`Hinty Agents ${VERSION}`))
   if (!isPaired(cfg) || !cfg) { out('Paired:   no (run: npx hinty-agents)'); return 0 }
-  out(`Paired:   yes, "${cfg.label || '?'}" on ${cfg.api}`)
+  out(`Paired:   yes, "${oneLine(cfg.label || '?', 60)}" on ${cfg.api}${cfg.account ? `, account ${oneLine(cfg.account, 60)}` : ''}`)
+  out(`Remote:   switching away mode ON from the panel/glasses is ${cfg.remoteAwayOn === true ? c.warn('allowed') : 'not allowed'} (npx hinty-agents remote-away on|off)`)
   const s = await daemonStatus()
-  if (!s) { out(`Service:  ${c.warn('not running')} (start: npx hinty-agents start)`); return 0 }
+  if (!s) {
+    const old = olderServicePid()
+    if (old) out(`Service:  ${c.warn(`an older version is running (pid ${old})`)}: npx hinty-agents stop && npx hinty-agents start`)
+    else out(`Service:  ${c.warn('not running')} (start: npx hinty-agents start)`)
+    return 0
+  }
   out(`Service:  running, pid ${s.pid}, since ${new Date(s.startedAt).toLocaleString()}`)
-  out(`Link:     ${s.relay.connected ? c.ok('connected') : c.warn(`not connected${s.relay.lastError ? ` (${s.relay.lastError})` : ''}`)}`)
-  out(`Away:     ${s.away.on ? c.ok(`ON until ${new Date(s.away.until).toLocaleTimeString()}`) : 'off (nothing leaves this computer)'}`)
+  out(`Link:     ${s.relay.connected ? c.ok('connected') : c.warn(`not connected${s.relay.lastError ? ` (${oneLine(s.relay.lastError, 60)})` : ''}`)}`)
+  out(`Away:     ${awayLine(s.away)}`)
+  if (s.away.remoteRefusedAt) out(`          ${c.warn(`a remote switch-on was refused at ${hhmm(s.away.remoteRefusedAt)} (not allowed on this computer)`)}`)
   out(`Waiting:  ${s.perms} permission request(s)`)
   if (s.voice) out(`Voice:    ${s.voice.ready ? c.ok('ready') : 'not installed (npx hinty-agents voice install)'}`)
   out(`Sessions: ${s.sessions.length ? '' : 'none'}`)
   for (const x of s.sessions) {
     const via = x.agent !== 'claude' ? 'hooks' : x.mod ? 'mod ok' : c.warn('no mod contact')
-    out(`  ${x.label.padEnd(24)} ${x.agent.padEnd(7)} ${x.st.padEnd(5)} ${via}`)
+    out(`  ${oneLine(x.label, 24).padEnd(24)} ${oneLine(x.agent, 10).padEnd(7)} ${oneLine(x.st, 5).padEnd(5)} ${via}`)
+  }
+  return 0
+}
+
+/** @param {{ on: boolean, until: number, since?: number, by?: string }} a */
+function awayLine(a) {
+  if (!a.on) return 'off (nothing leaves this computer)'
+  const remote = a.by === 'remote' && a.since ? c.warn(` - switched on REMOTELY at ${hhmm(a.since)} (panel or glasses). Not you? npx hinty-agents away off`) : ''
+  return c.ok(`ON until ${new Date(a.until).toLocaleTimeString()}`) + remote
+}
+
+/** HINTY_AGENTS_API (another server than Hinty's): warned, and plain http only to this computer (security review point 8). */
+function checkApi(/** @type {string} */ api) {
+  if (api === DEFAULT_API) return true
+  let u
+  try { u = new URL(api) } catch { out(c.bad(`✗ HINTY_AGENTS_API is not a URL: ${oneLine(api, 80)}`)); return false }
+  if (u.protocol !== 'https:' && !(u.protocol === 'http:' && ['127.0.0.1', 'localhost', '[::1]'].includes(u.hostname))) {
+    out(c.bad(`✗ ${oneLine(api, 80)}: only https (or http to this computer) is accepted`))
+    return false
+  }
+  out(c.warn(`! Pairing with a server other than Hinty's: ${oneLine(api, 80)} (HINTY_AGENTS_API). Continue only if you set it yourself.`))
+  return true
+}
+
+/** @param {string | undefined} arg */
+async function remoteAwayCmd(arg) {
+  if (arg !== 'on' && arg !== 'off') {
+    const cfg = readConfig()
+    out(`Remote switch-on of away mode: ${cfg?.remoteAwayOn === true ? 'allowed' : 'not allowed'}`)
+    out('Usage: npx hinty-agents remote-away on|off')
+    return arg === undefined ? 0 : 1
+  }
+  if (!readConfig()) { out('Not paired yet. Run: npx hinty-agents'); return 1 }
+  updateConfig({ remoteAwayOn: arg === 'on' })
+  if (arg === 'on') {
+    for (const l of REMOTE_AWAY_TEXT) out(l)
+    out(`\n${c.ok('✓')} Remote switch-on ALLOWED. Undo: npx hinty-agents remote-away off`)
+  } else {
+    out(`${c.ok('✓')} Remote switch-on not allowed: only this computer switches away mode on (switching it off remotely still works).`)
+    const s = await daemonStatus()
+    if (s && s.away.on && s.away.by === 'remote') out(c.warn('! Away mode is ON now (switched on remotely). To switch it off: npx hinty-agents away off'))
   }
   return 0
 }
@@ -373,17 +554,9 @@ async function unpair() {
     for (let i = 0; i < 30 && pidAlive(info.pid); i++) await sleep(100)
   } else {
     // the service is not running: open the link once, say `unpair`, close
-    const relay = new Relay({ api: cfg.api, token: /** @type {string} */ (cfg.bridgeToken) })
-    told = await new Promise((resolve) => {
-      const t = setTimeout(() => { relay.stop(); resolve(false) }, 8000)
-      relay.on('relay', (ev) => {
-        if (ev === 'ready') { relay.send('unpair'); setTimeout(() => { clearTimeout(t); relay.stop(); resolve(true) }, 800) }
-        if (ev === 'invalid_token') { clearTimeout(t); relay.stop(); resolve(true) }
-      })
-      relay.start()
-    })
+    told = /** @type {boolean} */ (await tellServerUnpair(cfg.api, /** @type {string} */ (cfg.bridgeToken)))
   }
-  updateConfig({ bridgeToken: undefined, bridgeId: undefined })
+  updateConfig({ bridgeToken: undefined, bridgeId: undefined, account: undefined })
   out(told ? `${c.ok('✓')} Unpaired. The token is deleted.` : `${c.warn('!')} The token is deleted here, but the server was not reached: remove the computer in the Hinty panel too.`)
   return 0
 }
@@ -398,13 +571,16 @@ async function doctor() {
   out(c.b(`Hinty Agents ${VERSION} doctor`))
   line(Number(process.versions.node.split('.')[0]) >= 20, `Node.js ${process.versions.node}`)
   const cfg = readConfig()
-  line(isPaired(cfg), isPaired(cfg) ? `Paired with ${cfg?.api} as "${cfg?.label}"` : 'Not paired', 'npx hinty-agents')
+  line(isPaired(cfg), isPaired(cfg) ? `Paired with ${cfg?.api} as "${oneLine(cfg?.label, 60)}"${cfg?.account ? `, account ${oneLine(cfg.account, 60)}` : ''}` : 'Not paired', 'npx hinty-agents')
+  line(null, `Remote switch-on of away mode ${cfg?.remoteAwayOn === true ? 'ALLOWED' : 'not allowed'}`, 'npx hinty-agents remote-away on|off')
 
   const cc = claude.detect()
   line(cc.found, cc.found ? `Claude Code ${cc.version}` : 'Claude Code not found')
   if (cc.found) {
     const inst = claude.installed()
     line(inst.installed && inst.enabled, inst.installed ? `Plugin ${claude.PLUGIN_ID} ${inst.version || ''} ${inst.enabled ? 'enabled' : 'DISABLED'}${inst.folder ? ` (${inst.folder})` : ''}` : 'Plugin not installed', inst.installed ? undefined : 'npx hinty-agents install claude')
+    // the plugin and this service must speak the same local protocol; an older plugin stays silent
+    if (inst.installed && inst.version && inst.version !== VERSION) line(false, `Plugin ${inst.version} is not this version (${VERSION}): its hooks stay silent`, 'npx hinty-agents install claude')
     const v = claude.validate(inst.folder && fs.existsSync(inst.folder) ? inst.folder : claude.pluginDir())
     line(v.ok, v.ok ? 'Plugin and mod pass `claude plugin validate`' : `Plugin does not validate: ${v.errors.slice(0, 2).join('; ')}`)
   }
@@ -433,11 +609,12 @@ async function doctor() {
   }
 
   const s = await daemonStatus()
-  line(!!s, s ? `Service running (pid ${s.pid})` : 'Service not running', s ? undefined : 'npx hinty-agents start')
+  const old = s ? 0 : olderServicePid()
+  line(!!s, s ? `Service running (pid ${s.pid})` : old ? `An older version of the service is running (pid ${old})` : 'Service not running', s ? undefined : old ? 'npx hinty-agents stop && npx hinty-agents start' : 'npx hinty-agents start')
   if (s) {
-    line(s.relay.connected, s.relay.connected ? 'Link to Hinty connected' : `Link to Hinty down${s.relay.lastError ? ` (${s.relay.lastError})` : ''}`)
-    line(null, `Away mode ${s.away.on ? `ON until ${new Date(s.away.until).toLocaleTimeString()}` : 'off'}`)
-    const hook = spawnSync(process.execPath, [`${claude.pluginDir()}/hook.cjs`, 'Doctor'], { encoding: 'utf8', timeout: 10000, env: process.env, windowsHide: true })
+    line(s.relay.connected, s.relay.connected ? 'Link to Hinty connected' : `Link to Hinty down${s.relay.lastError ? ` (${oneLine(s.relay.lastError, 60)})` : ''}`)
+    line(null, `Away mode ${awayLine(s.away)}`)
+    const hook = spawnSync(process.execPath, [`${claude.pluginDir()}/hook.cjs`, 'Doctor'], { encoding: 'utf8', timeout: 10000, env: childEnv(), windowsHide: true, cwd: os.homedir() })
     let h = null
     try { h = JSON.parse(hook.stdout) } catch { /* no answer */ }
     line(!!(h && h.ok), h && h.ok ? `Hook reaches the service (${h.ms} ms)` : 'Hook cannot reach the service')

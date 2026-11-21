@@ -10,7 +10,7 @@ import path from 'node:path'
 import { fileURLToPath } from 'node:url'
 import * as codex from '../src/adapters/codex.js'
 import { activeAgents } from '../src/adapters/index.js'
-import { createLocalServer, listenLoopback } from '../src/local-http.js'
+import { fakeService as fake, writeDaemon } from './helpers.js'
 import { Service } from '../src/service.js'
 
 const HOOK = fileURLToPath(new URL('../hooks/codex-hook.cjs', import.meta.url))
@@ -127,12 +127,7 @@ function runHook(dir, event, input) {
 }
 const INPUT = JSON.stringify({ session_id: SID, cwd: 'C:\\w\\api', hook_event_name: 'PermissionRequest', tool_name: 'Bash', tool_input: { command: 'ls' } })
 
-async function fakeService(dir, routes, secret = 'k'.repeat(43)) {
-  const s = createLocalServer({ secret, routes })
-  const port = await listenLoopback(s)
-  fs.writeFileSync(path.join(dir, 'daemon.json'), JSON.stringify({ v: 1, pid: process.pid, port, secret }))
-  return s
-}
+const fakeService = (dir, routes) => fake(dir, routes)
 
 test('N1: no service, dead port, bad daemon.json = no output, exit 0, quickly (every event)', async () => {
   const dir = tmp('hinty-hook-')
@@ -141,7 +136,7 @@ test('N1: no service, dead port, bad daemon.json = no output, exit 0, quickly (e
     assert.deepEqual([r.code, r.stdout, r.stderr], [0, '', ''], ev)
     assert.ok(r.ms < 1500, `${ev} took ${r.ms} ms`)
   }
-  fs.writeFileSync(path.join(dir, 'daemon.json'), JSON.stringify({ v: 1, pid: 1, port: 9, secret: 'x' }))
+  writeDaemon(dir, { pid: 1, port: 9, key: 'x'.repeat(43) })
   assert.equal((await runHook(dir, 'PermissionRequest', INPUT)).stdout, '')
   fs.writeFileSync(path.join(dir, 'daemon.json'), '{not json')
   assert.equal((await runHook(dir, 'Stop', INPUT)).stdout, '')
@@ -173,9 +168,9 @@ test('N2: PermissionRequest prints only the two fixed answers; Stop prints only 
 test('an answer without the right proof is ignored (a stranger on the port cannot allow anything)', async () => {
   const dir = tmp('hinty-hook-')
   const http = await import('node:http')
-  const srv = http.createServer((req, res) => { res.writeHead(200, { 'content-type': 'application/json', 'x-hinty-proof': 'f'.repeat(64) }); res.end('{"d":"allow"}') })
+  const srv = http.createServer((req, res) => { res.writeHead(200, { 'content-type': 'application/json', 'x-hinty-sig': 'f'.repeat(64) }); res.end('{"d":"allow"}') })
   await new Promise((r) => srv.listen(0, '127.0.0.1', r))
-  fs.writeFileSync(path.join(dir, 'daemon.json'), JSON.stringify({ v: 1, pid: 1, port: srv.address().port, secret: 'k'.repeat(43) }))
+  writeDaemon(dir, { pid: 1, port: srv.address().port, key: 'k'.repeat(43) })
   const r = await runHook(dir, 'PermissionRequest', INPUT)
   srv.close()
   assert.equal(r.stdout, '')
@@ -326,12 +321,29 @@ test('say with `codex queue`: handed to the queue with the CODEX_HOME of the ses
   await sleep(10)
   assert.deepEqual(calls, [[SID, '-x --evil "q" & dir', 'C:\h\.codex']])
   assert.equal(svc.cmds.size, 0)
-  // queue refuses once: the instruction is kept for a held Stop hook, and holds are on from then
+  // queue refuses once: the instruction is kept and handed over at the next Stop hook; one failure does not turn the
+  // queue off (security review point 10), three in a row do
   ok = false
   svc.onRelay('say', { sid: SID, text: 'second' })
   await sleep(10)
   assert.equal(svc.cmds.get(SID).length, 1)
   assert.match((await svc.codexStop(stopInput())).cmd, /second$/)
+  assert.equal(svc.codexQueueBroken, false)
+  ok = true
+  svc.onRelay('say', { sid: SID, text: 'third' })
+  await sleep(10)
+  assert.equal(svc.codexQueueFails, 0, 'a success resets the count')
+  calls.length = 2
+  ok = false
+  for (const t of ['f1', 'f2', 'f3']) { svc.onRelay('say', { sid: SID, text: t }); await sleep(5) }
+  assert.equal(svc.codexQueueBroken, true)
+  svc.cmds.delete(SID)
+  // a NUL or other control characters never reach `codex queue` (they would break the call)
+  ok = true; svc.codexQueueBroken = false; svc.codexQueueFails = 0; calls.length = 0
+  svc.onRelay('say', { sid: SID, text: 'run\u0000 tests\u001b[2J now' })
+  await sleep(10)
+  assert.deepEqual(calls.map((c) => c[1]), ['run tests[2J now'])
+  calls.length = 2
   // say for an unknown session or with away off never reaches the queue
   svc.onRelay('say', { sid: 'nope', text: 'x' }); svc.setAway(false, 'x'); svc.onRelay('say', { sid: SID, text: 'x' })
   await sleep(10)
