@@ -20,9 +20,18 @@ import { MODELS } from './stt/models.js'
 import { fmtMB, installVoice, removeVoice, voiceStatus } from './stt/install.js'
 import { VERSION } from './version.js'
 
-const NAMES = /** @type {Record<string, string>} */ ({ codex: 'Codex CLI', grok: 'Grok Build', openclaw: 'OpenClaw', hermes: 'Hermes Agent' })
+export const NAMES = /** @type {Record<string, string>} */ ({ codex: 'Codex CLI', grok: 'Grok Build', openclaw: 'OpenClaw', hermes: 'Hermes Agent' })
 const sleep = (/** @type {number} */ ms) => new Promise((r) => setTimeout(r, ms))
-const out = (/** @type {string} */ s = '') => process.stdout.write(s + '\n')
+const print = (/** @type {string} */ s) => { process.stdout.write(s + '\n') }
+let sink = print
+const out = (/** @type {string} */ s = '') => sink(s)
+/**
+ * Where the commands' lines go: the terminal, or (the desktop app's worker, src/desktop.js) a collector. null = the
+ * terminal again. @param {((s: string) => void) | null} fn
+ */
+export function setOutput(fn) { sink = fn || print }
+/** One line where the commands' lines go now. @param {string} s */
+export function printLine(s) { out(s) }
 const color = process.stdout.isTTY && !process.env.NO_COLOR
 const c = {
   ok: (/** @type {string} */ s) => (color ? `\x1b[32m${s}\x1b[0m` : s),
@@ -83,6 +92,11 @@ async function dispatch(cmd, rest, argv) {
       // a service that refused to start (not paired, changed program copy) set the exit code itself
       return Number(process.exitCode) || 0
     }
+    case 'desktop': {
+      // the worker of the desktop app (desktop/ in this repository): requests over the IPC channel the app opened
+      const { runDesktop } = await import('./desktop.js')
+      return runDesktop()
+    }
     case 'status': return showStatus()
     case 'away': return away(rest[0])
     case 'remote-away': return remoteAwayCmd(rest[0])
@@ -91,7 +105,9 @@ async function dispatch(cmd, rest, argv) {
     case 'doctor': return doctor()
     case 'unpair': return unpair()
     case 'start': return start()
-    case 'stop': return stop()
+    // --for-update (the desktop app's uninstaller before an update): stop without marking the service as stopped, so
+    // the new version starts it again
+    case 'stop': return stop({ forUpdate: rest.includes('--for-update') })
     case 'voice': return voice(rest)
     case '-v':
     case '--version':
@@ -111,11 +127,11 @@ async function dispatch(cmd, rest, argv) {
 }
 
 /** API of this computer's pairing (stored at pairing); HINTY_AGENTS_API only picks the server for a new pairing. */
-function apiFor(/** @type {import('./store.js').Config | null} */ cfg) {
+export function apiFor(/** @type {import('./store.js').Config | null} */ cfg) {
   return (cfg && cfg.api) || process.env.HINTY_AGENTS_API || DEFAULT_API
 }
 
-function panelUrl(/** @type {string} */ api) {
+export function panelUrl(/** @type {string} */ api) {
   if (process.env.HINTY_AGENTS_WEB) return oneLine(process.env.HINTY_AGENTS_WEB, 200)
   return api === DEFAULT_API ? 'https://www.hinty.eu/dashboard/voice-assistant/agents' : null
 }
@@ -163,14 +179,14 @@ function closeInput() {
 }
 
 /** Is a service of ANOTHER version running (daemon.json of an older protocol, its pid our service)? */
-function olderServicePid() {
+export function olderServicePid() {
   const any = readDaemonAny()
   if (!any || !any.old || !pidAlive(any.pid)) return 0
   return isOurDaemonLine(processCommandLine(any.pid)) ? any.pid : 0
 }
 
 /** The server may tell this bridge "unpaired" (a token it gave us that we do not keep). @param {string} api @param {string} token */
-function tellServerUnpair(api, token) {
+export function tellServerUnpair(api, token) {
   const relay = new Relay({ api, token })
   return new Promise((resolve) => {
     const t = setTimeout(() => { relay.stop(); resolve(false) }, 8000)
@@ -182,7 +198,7 @@ function tellServerUnpair(api, token) {
   })
 }
 
-const REMOTE_AWAY_TEXT = [
+export const REMOTE_AWAY_TEXT = [
   'Away mode is what lets your glasses and the Hinty panel answer permission prompts and send instructions to your',
   'agents. You can always switch it on here: npx hinty-agents away on',
   '',
@@ -205,7 +221,7 @@ const REMOTE_AWAY_TEXT = [
  * marketplace must not point into an npx cache folder npm may clean. A git checkout is used as it is.
  * @returns {boolean} false when the copy could not be made (the message is printed)
  */
-function useStableCopy() {
+export function useStableCopy() {
   try {
     const r = ensureApp()
     if (r.copied) out(`${c.ok('✓')} Program copied to ${r.root} (the service and the plugin use this copy, not npm's cache).`)
@@ -234,7 +250,7 @@ export async function startDaemon() {
   return null
 }
 
-async function start() {
+export async function start() {
   if (!useStableCopy()) return 1
   const cfg = readConfig()
   if (!isPaired(cfg)) { out('Not paired yet. Run: npx hinty-agents'); return 1 }
@@ -250,9 +266,10 @@ async function start() {
  * Stop the service. Security review point 7: the pid in daemon.json is killed only when it is our service (a signed
  * answer with the same pid, or the command line `node .../hinty-agents.js daemon`). After a reboot that pid may
  * belong to any other program: then only the stale files are removed.
+ * @param {{ forUpdate?: boolean }} [o] forUpdate: leave `stopped` as it is (the next version starts the service again)
  */
-async function stop() {
-  if (readConfig()) updateConfig({ stopped: true })
+export async function stop(o = {}) {
+  if (readConfig() && !o.forUpdate) updateConfig({ stopped: true })
   const any = readDaemonAny()
   const removeFiles = () => {
     try { fs.unlinkSync(paths().daemon) } catch { /* gone */ }
@@ -289,6 +306,65 @@ async function stop() {
 // Setup wizard
 // ------------------------------------------------------------------------------------------------
 
+/**
+ * @typedef {{ ok: true, cfg: import('./store.js').Config, account: string | null }
+ *   | { ok: false, stage: 'pair' | 'check', code: string, message: string, told?: boolean }} PairResult
+ */
+
+/**
+ * Pair this computer: get a code, wait for it to be typed in a Hinty panel, then the 4-digit check (review 2, Z10).
+ * Shared by the terminal wizard and the desktop app (src/desktop.js), so both keep the same rules: no check number from
+ * the server = refused; the number typed here must match sha256(token + ":" + number) the server sent, at most
+ * CHECK_TRIES tries; any refusal tells the server to drop this computer again and saves nothing. The token is written
+ * to config.json only after a match.
+ * @param {{ api: string, label: string, signal?: AbortSignal, io?: any,
+ *   onCode: (code: string, expiresIn: number) => void, onClaimed?: (account: string | null) => void,
+ *   beforeCheck?: () => string, askCheck: (attempt: number) => Promise<string | null>, onMismatch?: (left: number) => void,
+ *   retryHint?: string }} o
+ *   askCheck resolves with what the person typed, or null when there is nothing more to read (end of input, cancel)
+ * @returns {Promise<PairResult>}
+ */
+export async function pairComputer(o) {
+  const { api, label } = o
+  let res
+  try {
+    res = await pair({ api, label, host: os.hostname(), onCode: o.onCode, signal: o.signal, ...(o.io ? { io: o.io } : {}) })
+  } catch (e) {
+    const m = /** @type {Error} */ (e).message
+    const code = m === 'refused:off' ? 'off' : m === 'refused:not_allowed' ? 'not_allowed' : m === 'unreachable' ? 'unreachable'
+      : m === 'pairing_timeout' ? 'timeout' : m === 'cancelled' ? 'cancelled' : 'other'
+    const message = code === 'off' ? 'Hinty Agents is not switched on on this server yet.'
+      : code === 'not_allowed' ? 'Hinty Agents is not available for this account yet.'
+        : code === 'unreachable' ? `Cannot reach ${api}.`
+          : code === 'timeout' ? 'No code was entered in time.'
+            : code === 'cancelled' ? 'Cancelled.' : m
+    return { ok: false, stage: 'pair', code, message }
+  }
+  // review 2, Z10: whoever typed the code now steers this computer. The panel that typed it shows a 4-digit number;
+  // only the person who typed the code in their OWN panel can copy it here. Anything else unpairs at once.
+  const refuse = async (/** @type {string} */ code, /** @type {string} */ message) => {
+    const told = /** @type {boolean} */ (await tellServerUnpair(api, res.token))
+    return /** @type {PairResult} */ ({ ok: false, stage: 'check', code, message, told })
+  }
+  o.onClaimed?.(res.account)
+  if (!res.checkHash) return refuse('no_check', 'The server did not send the check number (an older Hinty server?).')
+  const notHere = o.beforeCheck ? o.beforeCheck() : ''
+  if (notHere) return refuse('no_person', notHere)
+  let matched = false
+  let ended = false
+  for (let i = 1; i <= CHECK_TRIES && !matched; i++) {
+    const typed = await o.askCheck(i)
+    if (typed === null) { ended = true; break }
+    matched = checkMatches(res.token, res.checkHash, typed)
+    if (!matched && i < CHECK_TRIES) o.onMismatch?.(CHECK_TRIES - i)
+  }
+  if (!matched) {
+    return refuse(ended ? 'ended' : 'mismatch', `The number did not match the one in the Hinty panel. If you typed the pairing code in your own panel, ${o.retryHint || 'pair again'}; if you did not, somebody else may have entered your code.`)
+  }
+  const cfg = updateConfig({ api, bridgeToken: res.token, bridgeId: res.bridgeId, label, host: os.hostname(), pairedAt: new Date().toISOString(), entry: cliEntry(), ...(res.account ? { account: res.account } : {}) })
+  return { ok: true, cfg, account: res.account }
+}
+
 /** @param {string[]} args */
 async function setup(args) {
   const noInstall = args.includes('--no-install')
@@ -319,52 +395,37 @@ async function setup(args) {
       return 1
     }
     out(`\nPairing with ${api} ...`)
-    let res
-    try {
-      res = await pair({
-        api, label, host: os.hostname(),
-        onCode: (code, expiresIn) => {
-          const url = panelUrl(api)
-          out('')
-          out(`  Pairing code:  ${c.b(prettyCode(code))}`)
-          out(url
-            ? `  Open ${url} and type the code (valid ${Math.round(expiresIn / 60)} min).`
-            : `  Type it in the Hinty panel: Voice Assistant -> Agents (valid ${Math.round(expiresIn / 60)} min).`)
-          out('  The panel then shows a 4-digit number: you will type it here.')
-          out(c.dim('  Waiting for the code to be entered... (Ctrl+C to cancel)'))
-        },
-      })
-    } catch (e) {
-      const m = /** @type {Error} */ (e).message
-      const why = m === 'refused:off' ? 'Hinty Agents is not switched on on this server yet.'
-        : m === 'refused:not_allowed' ? 'Hinty Agents is not available for this account yet.'
-          : m === 'unreachable' ? `Cannot reach ${api}.`
-            : m === 'pairing_timeout' ? 'No code was entered in time.' : m
-      out(c.bad(`\n✗ Pairing failed: ${why}`))
+    const r = await pairComputer({
+      api, label,
+      onCode: (code, expiresIn) => {
+        const url = panelUrl(api)
+        out('')
+        out(`  Pairing code:  ${c.b(prettyCode(code))}`)
+        out(url
+          ? `  Open ${url} and type the code (valid ${Math.round(expiresIn / 60)} min).`
+          : `  Type it in the Hinty panel: Voice Assistant -> Agents (valid ${Math.round(expiresIn / 60)} min).`)
+        out('  The panel then shows a 4-digit number: you will type it here.')
+        out(c.dim('  Waiting for the code to be entered... (Ctrl+C to cancel)'))
+      },
+      onClaimed: (account) => {
+        out('')
+        if (account) out(`  The code was entered by the Hinty account  ${c.b(account)}`)
+      },
+      beforeCheck: () => (interactive() ? '' : 'Pairing needs a person at this terminal.'),
+      askCheck: async () => {
+        const typed = await ask(`  Type the 4-digit number shown in the Hinty panel: `)
+        return inputClosed && !typed ? null : typed
+      },
+      onMismatch: (left) => out(c.warn(`  That is not the number in the panel (${left} ${left === 1 ? 'try' : 'tries'} left).`)),
+      retryHint: 'run `npx hinty-agents` again',
+    })
+    if (!r.ok) {
+      out(c.bad(r.stage === 'pair'
+        ? `\n✗ Pairing failed: ${r.message}`
+        : `\n✗ ${r.message} This computer was ${r.told ? 'disconnected from that account again' : 'not kept; remove it in the Hinty panel too (the server was not reached)'}. Nothing was saved.`))
       return 1
     }
-    // review 2, Z10: whoever typed the code now steers this computer. The panel that typed it shows a 4-digit number;
-    // only the person who typed the code in their OWN panel can copy it here. Anything else unpairs at once.
-    const refuse = async (/** @type {string} */ why) => {
-      const told = await tellServerUnpair(api, res.token)
-      out(c.bad(`\n✗ ${why} This computer was ${told ? 'disconnected from that account again' : 'not kept; remove it in the Hinty panel too (the server was not reached)'}. Nothing was saved.`))
-      return 1
-    }
-    out('')
-    if (res.account) out(`  The code was entered by the Hinty account  ${c.b(res.account)}`)
-    if (!res.checkHash) return refuse('The server did not send the check number (an older Hinty server?).')
-    if (!interactive()) return refuse('Pairing needs a person at this terminal.')
-    let matched = false
-    for (let i = 1; i <= CHECK_TRIES && !matched; i++) {
-      const typed = await ask(`  Type the 4-digit number shown in the Hinty panel: `)
-      if (inputClosed && !typed) break
-      matched = checkMatches(res.token, res.checkHash, typed)
-      if (!matched && i < CHECK_TRIES) out(c.warn(`  That is not the number in the panel (${CHECK_TRIES - i} ${CHECK_TRIES - i === 1 ? 'try' : 'tries'} left).`))
-    }
-    if (!matched) {
-      return refuse('The number did not match the one in the Hinty panel. If you typed the pairing code in your own panel, run `npx hinty-agents` again; if you did not, somebody else may have entered your code.')
-    }
-    cfg = updateConfig({ api, bridgeToken: res.token, bridgeId: res.bridgeId, label, host: os.hostname(), pairedAt: new Date().toISOString(), entry: cliEntry(), ...(res.account ? { account: res.account } : {}) })
+    cfg = r.cfg
     out(`${c.ok('✓')} Paired. The token is in ${paths().config} (readable by you only).`)
   }
 
@@ -409,7 +470,7 @@ async function setup(args) {
 // Commands
 // ------------------------------------------------------------------------------------------------
 
-async function showStatus() {
+export async function showStatus() {
   const cfg = readConfig()
   out(c.b(`Hinty Agents ${VERSION}`))
   if (!isPaired(cfg) || !cfg) { out('Paired:   no (run: npx hinty-agents)'); return 0 }
@@ -445,14 +506,14 @@ async function showStatus() {
 }
 
 /** @param {{ on: boolean, until: number, since?: number, by?: string }} a */
-function awayLine(a) {
+export function awayLine(a) {
   if (!a.on) return 'off (nothing leaves this computer)'
   const remote = a.by === 'remote' && a.since ? c.warn(` - switched on REMOTELY at ${hhmm(a.since)} (panel or glasses). Not you? npx hinty-agents away off`) : ''
   return c.ok(`ON until ${new Date(a.until).toLocaleTimeString()}`) + remote
 }
 
 /** HINTY_AGENTS_API (another server than Hinty's): warned, and plain http only to this computer (security review point 8). */
-function checkApi(/** @type {string} */ api) {
+export function checkApi(/** @type {string} */ api) {
   if (api === DEFAULT_API) return true
   let u
   try { u = new URL(api) } catch { out(c.bad(`✗ HINTY_AGENTS_API is not a URL: ${oneLine(api, 80)}`)); return false }
@@ -465,7 +526,7 @@ function checkApi(/** @type {string} */ api) {
 }
 
 /** @param {string | undefined} arg */
-async function remoteAwayCmd(arg) {
+export async function remoteAwayCmd(arg) {
   if (arg !== 'on' && arg !== 'off') {
     const cfg = readConfig()
     out(`Remote switch-on of away mode: ${cfg?.remoteAwayOn === true ? 'allowed' : 'not allowed'}`)
@@ -488,7 +549,7 @@ async function remoteAwayCmd(arg) {
 }
 
 /** @param {string[]} args */
-async function voice(args) {
+export async function voice(args) {
   const [sub, ...rest] = args
   const mi = rest.indexOf('--model')
   const model = mi >= 0 ? rest[mi + 1] : undefined
@@ -522,7 +583,7 @@ async function voice(args) {
 }
 
 /** After installing or removing the voice: a running service says `hello` again (with or without `stt`). */
-async function tellService() {
+export async function tellService() {
   if (!readDaemonInfo()) return
   try {
     const r = await call('POST', '/v1/voice/reload')
@@ -533,7 +594,7 @@ async function tellService() {
 }
 
 /** @param {string | undefined} arg */
-async function away(arg) {
+export async function away(arg) {
   if (arg !== 'on' && arg !== 'off') { out('Usage: npx hinty-agents away on|off'); return 1 }
   const on = arg === 'on'
   const cfg = readConfig()
@@ -555,13 +616,13 @@ async function away(arg) {
 }
 
 /** After install / uninstall: a running service says `hello` again with the new list of agents. */
-async function tellAgents() {
+export async function tellAgents() {
   if (!readDaemonInfo()) return
   try { await call('POST', '/v1/agents/reload') } catch { /* the service did not answer: it reads the files at its next start */ }
 }
 
 /** @param {string | undefined} agent @param {string[]} [flags] */
-async function installCmd(agent, flags = []) {
+export async function installCmd(agent, flags = []) {
   const a = getAdapter(agent)
   if (!a) { out(`Usage: npx hinty-agents install <${Object.keys(ADAPTERS).join('|')}>`); return 1 }
   if (!useStableCopy()) return 1
@@ -599,7 +660,7 @@ async function installCmd(agent, flags = []) {
 }
 
 /** @param {string | undefined} agent */
-async function uninstallCmd(agent) {
+export async function uninstallCmd(agent) {
   const a = getAdapter(agent)
   if (!a) { out(`Usage: npx hinty-agents uninstall <${Object.keys(ADAPTERS).join('|')}>`); return 1 }
   const r = await a.uninstall()
@@ -613,7 +674,7 @@ async function uninstallCmd(agent) {
  * asking) the data folder. Each step is tolerant: what is not there is skipped.
  * @param {string[]} flags
  */
-async function uninstallAll(flags) {
+export async function uninstallAll(flags) {
   let bad = 0
   for (const id of Object.keys(ADAPTERS)) {
     const a = ADAPTERS[id]
@@ -659,7 +720,7 @@ async function uninstallAll(flags) {
   return bad ? 1 : 0
 }
 
-async function unpair() {
+export async function unpair() {
   const cfg = readConfig()
   if (!isPaired(cfg) || !cfg) { out('This computer is not paired.'); return 0 }
   const info = readDaemonInfo()
@@ -676,7 +737,7 @@ async function unpair() {
   return 0
 }
 
-async function doctor() {
+export async function doctor() {
   let bad = 0
   /** @param {boolean | null} ok @param {string} text @param {string} [hint] */
   const line = (ok, text, hint) => {
@@ -720,6 +781,14 @@ async function doctor() {
     if (inst.installed && inst.version && inst.version !== VERSION) line(false, `Plugin ${inst.version} is not this version (${VERSION}): its hooks stay silent`, 'npx hinty-agents install claude')
     // a directory plugin loads in place from the marketplace folder: if that folder is gone the plugin does nothing
     if (inst.installed && inst.folder && !fs.existsSync(inst.folder)) line(false, `The plugin's folder is gone: ${inst.folder}`, 'npx hinty-agents install claude')
+    // the hooks start `node` from PATH, or (a copy made by the desktop app's bundled runtime) that Node.js by full path
+    if (inst.installed && inst.folder && fs.existsSync(inst.folder)) {
+      const hn = claude.checkHookNode(path.basename(inst.folder) === 'claude-plugin' ? path.dirname(inst.folder) : claude.repoRoot())
+      line(hn.ok, hn.byName
+        ? (hn.ok ? 'Plugin hooks start `node` from PATH' : 'Plugin hooks start `node` by name, but there is no Node.js on PATH: they do nothing')
+        : hn.command ? (hn.ok ? `Plugin hooks start Node.js at ${hn.command}` : `Plugin hooks start a Node.js that is gone: ${hn.command}`) : 'Plugin hooks: hooks.json not readable',
+      hn.ok ? undefined : 'npx hinty-agents install claude (or open the Hinty Agents app)')
+    }
     const v = claude.validate(inst.folder && fs.existsSync(inst.folder) ? inst.folder : claude.pluginDir())
     line(v.ok, v.ok ? 'Plugin and mod pass `claude plugin validate`' : `Plugin does not validate: ${v.errors.slice(0, 2).join('; ')}`)
   }

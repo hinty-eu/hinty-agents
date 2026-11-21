@@ -1,0 +1,88 @@
+# Hinty Agents desktop app for macOS: a signed and notarized DMG per processor (Apple silicon and Intel).
+# Run by hand (Actions -> "Desktop app (macOS)" -> Run workflow) or by pushing a tag desktop-v<version>.
+#
+# Secrets (Settings -> Secrets and variables -> Actions); without all of them the job stops at the first step:
+#   MAC_CERT_P12_BASE64          the "Developer ID Application" certificate with its private key, exported as .p12,
+#                                base64 (base64 -i cert.p12 | pbcopy)
+#   MAC_CERT_PASSWORD            the password of that .p12
+#   APPLE_ID                     the Apple ID e-mail of the developer account
+#   APPLE_APP_SPECIFIC_PASSWORD  an app-specific password for it (appleid.apple.com -> Sign-In and Security)
+#   APPLE_TEAM_ID                the 10-character team ID (developer.apple.com -> Membership)
+name: Desktop app (macOS)
+
+on:
+  workflow_dispatch:
+  push:
+    tags: ['desktop-v*']
+
+permissions:
+  contents: read
+
+concurrency:
+  group: desktop-mac-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  dmg:
+    runs-on: macos-latest
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        arch: [arm64, x64]
+    steps:
+      - name: Check the signing secrets
+        env:
+          MAC_CERT_P12_BASE64: ${{ secrets.MAC_CERT_P12_BASE64 }}
+          MAC_CERT_PASSWORD: ${{ secrets.MAC_CERT_PASSWORD }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_APP_SPECIFIC_PASSWORD: ${{ secrets.APPLE_APP_SPECIFIC_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+        run: |
+          missing=""
+          for name in MAC_CERT_P12_BASE64 MAC_CERT_PASSWORD APPLE_ID APPLE_APP_SPECIFIC_PASSWORD APPLE_TEAM_ID; do
+            if [ -z "${!name}" ]; then missing="$missing $name"; fi
+          done
+          if [ -n "$missing" ]; then
+            echo "::error title=Signing secrets missing::Add these repository secrets first:$missing (see the top of .github/workflows/desktop-mac.yml). Nothing was built: an unsigned, unnotarized app would be blocked by Gatekeeper."
+            exit 1
+          fi
+          echo "All signing secrets are set."
+
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '26'
+
+      - name: Install the bridge's dependencies (socket.io-client)
+        run: npm ci --omit=dev --ignore-scripts
+
+      - name: Install the desktop build tools (Electron, electron-builder)
+        working-directory: desktop
+        run: npm ci
+
+      - name: Build, sign and notarize the DMG
+        working-directory: desktop
+        env:
+          CSC_LINK: ${{ secrets.MAC_CERT_P12_BASE64 }}
+          CSC_KEY_PASSWORD: ${{ secrets.MAC_CERT_PASSWORD }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_APP_SPECIFIC_PASSWORD: ${{ secrets.APPLE_APP_SPECIFIC_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+        run: npm run dist:mac:${{ matrix.arch }}
+
+      - name: Check the signature and the notarization ticket
+        working-directory: desktop
+        run: |
+          app=$(ls -d dist/mac*/"Hinty Agents.app" | head -n 1)
+          codesign --verify --deep --strict --verbose=2 "$app"
+          codesign --verify --strict --verbose=2 "$app/Contents/Resources/node/bin/node"
+          xcrun stapler validate "$app"
+          spctl --assess --type execute --verbose "$app"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: Hinty-Agents-mac-${{ matrix.arch }}
+          path: desktop/dist/*.dmg
+          if-no-files-found: error

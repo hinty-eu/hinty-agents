@@ -1,5 +1,28 @@
 # Changelog
 
+## 0.4.0
+
+Desktop app for people who do not use a terminal (`desktop/`, README "Desktop app (Windows, macOS)").
+
+- **Hinty Agents app** (Electron): a window and a tray icon, 10 languages. Pairing with the code and the 4-digit check,
+  away mode, the remote switch-on consent as its own checkbox (off by default, risk next to it), connect / disconnect
+  each agent, voice install with a progress bar, "Remove everything", start at sign-in in the background. Windows: a
+  one-click NSIS installer per user, no administrator rights. macOS: a signed, notarized DMG per processor from
+  `.github/workflows/desktop-mac.yml` (needs the signing secrets; stops when they are missing).
+- **Node.js inside**: the official LTS build (26.13.1, sha256 of each archive pinned in
+  `desktop/scripts/node-runtime.mjs`), not Electron's binary in run-as-node mode: the agents start hooks by a command line
+  that cannot carry an environment variable, npm is needed for the voice engine, and Electron's RunAsNode,
+  NODE_OPTIONS and --inspect fuses stay off.
+- `hinty-agents desktop`: the app's worker (`src/desktop.js`), requests over an IPC channel only. Every button is one of
+  the CLI's own commands (their lines collected) or a read of the state; nothing in the security model changes.
+- Pairing is one shared function (`pairComputer` in `src/cli.js`) for the wizard and the app: no check number =
+  refused, 3 tries, any refusal unpairs at the server and saves nothing. `pair()` takes an AbortSignal (Cancel).
+- The program copy's Claude Code `hooks.json` names the running Node.js by its full path when that Node.js is not the
+  `node` on PATH (the bundled one); otherwise it keeps `node` as before. A copy made for another runtime is made again,
+  the manifest covers the changed file. `doctor` checks that the hooks' Node.js exists.
+- `stop --for-update` (the app's uninstaller before an update): stops the service without marking it stopped.
+- `voice install` reports byte progress over the VAD and the model (`progress` callback) for the app's progress bar.
+
 ## 0.3.2
 
 Small fixes after the fourth review.

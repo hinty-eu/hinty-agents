@@ -7,9 +7,11 @@
 // through the mod's $.prompt.submit (caps.say 'mod'). TODO (route 2, plan §4.2): when mods are disabled
 // (`disableAllHooks`, `allowManagedModsOnly`), hold the Stop hook in away mode and hand the instruction over as
 // `hookSpecificOutput.additionalContext` (not `decision: block`, which shows "Stop hook error"); limit 8 in a row.
+import fs from 'node:fs'
 import path from 'node:path'
 import { activeRoot } from '../root.js'
-import { resolveProgram, runSync } from '../exec.js'
+import { isAbsPath, resolveProgram, runSync, which } from '../exec.js'
+import { nodeExe } from './hookfiles.js'
 
 export const id = 'claude'
 export const PLUGIN = 'hinty-agents'
@@ -19,6 +21,84 @@ export const caps = { perm: 'prompt-only', say: 'mod' }
 
 export const repoRoot = () => activeRoot()
 export const pluginDir = () => path.join(repoRoot(), 'claude-plugin')
+
+// ------------------------------------------------------------------------------------------------
+// Which Node.js the plugin's hooks start. hooks.json uses the exec form (`command` + `args`, no shell) with
+// `"command": "node"`: Claude Code finds `node` on PATH. The desktop app (desktop/) runs this program on a Node.js it
+// bundles, which is not on PATH (its users often have no Node.js at all), so the program copy (app.js) gets the full
+// path of that Node.js instead. Only the copy is changed, never the package, and only the `command` of our own hooks.
+// ------------------------------------------------------------------------------------------------
+
+/** hooks.json inside a package folder or program copy @param {string} root */
+export const hooksFile = (root) => path.join(root, 'claude-plugin', 'hooks', 'hooks.json')
+
+const WIN = process.platform === 'win32'
+/** @param {string} p */
+const canon = (p) => { let r = p; try { r = fs.realpathSync(p) } catch { /* keep */ } return WIN ? r.toLowerCase() : r }
+
+/**
+ * The `command` the copy's hooks get: `node` while the Node.js running this program IS the `node` on PATH (an update of
+ * Node.js keeps working, as before); otherwise this Node.js by its full path (a bundled runtime, a Node.js started by
+ * full path). A path Claude Code could read as something else (`$`, `%`, quotes, not absolute) is never written:
+ * `node` stays, and `doctor` says when that finds nothing. Pure on its arguments.
+ * @param {string} [exe] @param {string | null} [onPath] the `node` our PATH lookup finds
+ */
+export function hookNode(exe = nodeExe(), onPath = which('node')) {
+  if (onPath && canon(onPath) === canon(exe)) return 'node'
+  if (!isAbsPath(exe) || /[$%"'`\r\n]/.test(exe)) return 'node'
+  return exe
+}
+
+/**
+ * The `command` of our hooks in hooks.json of <root>: one value for every hook, or null (unreadable, none, mixed).
+ * @param {string} root
+ */
+export function readHookNode(root) {
+  let j
+  try { j = JSON.parse(fs.readFileSync(hooksFile(root), 'utf8')) } catch { return null }
+  const cmds = new Set()
+  for (const groups of Object.values((j && j.hooks) || {})) {
+    for (const g of Array.isArray(groups) ? groups : []) for (const h of (g && Array.isArray(g.hooks) ? g.hooks : [])) cmds.add(h && h.command)
+  }
+  return cmds.size === 1 ? /** @type {string} */ ([...cmds][0]) : null
+}
+
+/**
+ * Point the hooks in hooks.json of <root> (a program copy being made) at <cmd>. Only exec-form hooks of ours (an
+ * `args` list whose first entry is `${CLAUDE_PLUGIN_ROOT}/hook.cjs`) change; `node` = the file stays as it is.
+ * @param {string} root @param {string} cmd
+ */
+export function writeHookNode(root, cmd) {
+  if (cmd === 'node' && readHookNode(root) === 'node') return false
+  const file = hooksFile(root)
+  const j = JSON.parse(fs.readFileSync(file, 'utf8'))
+  let changed = false
+  for (const groups of Object.values(j.hooks || {})) {
+    for (const g of groups) {
+      for (const h of g.hooks || []) {
+        if (h.type === 'command' && Array.isArray(h.args) && h.args[0] === '${CLAUDE_PLUGIN_ROOT}/hook.cjs' && h.command !== cmd) {
+          h.command = cmd
+          changed = true
+        }
+      }
+    }
+  }
+  if (changed) fs.writeFileSync(file, JSON.stringify(j, null, 2) + '\n')
+  return changed
+}
+
+/**
+ * For `doctor`: does the Node.js the installed copy's hooks start exist? `node` = the PATH lookup must find one.
+ * @param {string} root @returns {{ ok: boolean, command: string | null, byName: boolean }}
+ */
+export function checkHookNode(root) {
+  const command = readHookNode(root)
+  if (command === 'node') return { ok: !!which('node'), command, byName: true }
+  if (!command) return { ok: false, command, byName: false }
+  let ok = false
+  try { ok = fs.statSync(command).isFile() } catch { /* gone */ }
+  return { ok, command, byName: false }
+}
 
 /**
  * Run `claude` (always with DISABLE_AUTOUPDATER=1: an update interrupted mid-way breaks the CLI). Found by our own PATH

@@ -8,6 +8,7 @@ import fs from 'node:fs'
 import path from 'node:path'
 import { ensureHome, homeDir, narrowHome, noteCreated } from './store.js'
 import { activeRoot, packageRoot, setActiveRoot } from './root.js'
+import { hookNode, readHookNode, writeHookNode } from './adapters/claude.js'
 
 export const appBase = () => path.join(homeDir(), 'app')
 
@@ -294,11 +295,16 @@ export function ensureApp(o = {}) {
   noteCreated(base)
   const target = path.join(base, version)
   let copied = false
+  // the Node.js the copy's Claude Code hooks start: `node` from PATH, or this one by full path when it is not on PATH
+  // (the desktop app's bundled runtime); a copy made for another runtime is made again
+  const node = hookNode()
   // an existing folder of this version counts only when it matches the manifest we wrote when we made it (6b)
-  if (!verifyCopy(target, version).ok) {
+  if (!verifyCopy(target, version).ok || readHookNode(target) !== node) {
     const tmp = path.join(base, `.tmp-${process.pid}-${Date.now().toString(36)}`)
     try {
       copyPackage(src, tmp)
+      // before the manifest: the manifest then covers the changed hooks.json like every other file
+      writeHookNode(tmp, node)
       const manifest = buildManifest(tmp, version)
       if (fs.existsSync(target)) fs.renameSync(target, path.join(base, `.old-${process.pid}-${Date.now().toString(36)}`))
       fs.renameSync(tmp, target)

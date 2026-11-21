@@ -136,26 +136,41 @@ function installSherpa() {
 }
 
 /**
- * @param {{ model?: string, out?: (s: string) => void, selfTest?: (id: string) => Promise<void> }} [o]
+ * @typedef {{ phase: 'engine' | 'download' | 'check', done: number, total: number, file?: string }} VoiceProgress
+ * bytes of every file of the VAD and the model together (`done` counts a file already in place as done)
+ */
+
+/**
+ * @param {{ model?: string, out?: (s: string) => void, selfTest?: (id: string) => Promise<void>,
+ *   progress?: (p: VoiceProgress) => void, installEngine?: () => void }} [o]
+ *   progress: for a progress bar (the desktop app); installEngine: tests only
  */
 export async function installVoice(o = {}) {
   const id = o.model || DEFAULT_MODEL
   const out = o.out || (() => {})
+  const progress = o.progress || (() => {})
   const m = MODELS[id]
   if (!m || m.kind === 'vad') throw new Error(`unknown model "${id}" (choose: ${Object.keys(MODELS).filter((k) => MODELS[k].kind !== 'vad').join(', ')})`)
   ensureHome()
+  const total = [VAD_MODEL, id].reduce((a, mid) => a + MODELS[mid].files.reduce((b, f) => b + f.size, 0), 0)
+  progress({ phase: 'engine', done: 0, total })
   if (sherpaInstalled()) out(`sherpa-onnx-node ${SHERPA_VERSION}: already installed`)
-  else { out(`installing sherpa-onnx-node ${SHERPA_VERSION} into ${voiceDir()} ...`); installSherpa() }
+  else { out(`installing sherpa-onnx-node ${SHERPA_VERSION} into ${voiceDir()} ...`); (o.installEngine || installSherpa)() }
+  let before = 0
   for (const mid of [VAD_MODEL, id]) {
     for (const f of MODELS[mid].files) {
       let lastPct = -1
       const got = await downloadFile(f, modelDir(mid), (d, t) => {
         const pct = Math.floor((d / t) * 100)
         if (t > 5e6 && pct !== lastPct && pct % 10 === 0) { lastPct = pct; out(`  ${f.name}: ${pct}% (${fmtMB(d)} / ${fmtMB(t)})`) }
+        progress({ phase: 'download', done: before + d, total, file: f.name })
       })
+      before += f.size
+      progress({ phase: 'download', done: before, total, file: f.name })
       out(got ? `  ${f.name}: ok (${fmtMB(f.size)}, sha256 checked)` : `  ${f.name}: already there`)
     }
   }
+  progress({ phase: 'check', done: total, total })
   out('trial load of the model ...')
   const selfTest = o.selfTest || (async (/** @type {string} */ x) => { const { trialLoad } = await import('./sherpa.js'); await trialLoad(x) })
   await selfTest(id)

@@ -1,0 +1,77 @@
+# Hinty Agents desktop app. Build: npm run dist:win (Windows NSIS), npm run dist:mac:arm64 / dist:mac:x64 (macOS DMG,
+# see .github/workflows/desktop-mac.yml). `npm run stage` first puts the bridge and the pinned Node.js into build/.
+appId: eu.hinty.agents
+productName: Hinty Agents
+copyright: Copyright (c) 2026 Hinty
+
+directories:
+  output: dist
+  buildResources: build-resources
+
+files:
+  - package.json
+  - main.cjs
+  - preload.cjs
+  - ui/**/*
+
+# outside the asar archive: the bundled Node.js runs them as ordinary files. One entry from build/ on purpose:
+# electron-builder never copies the node_modules folder at the top of a `from` folder, and bridge/node_modules
+# (socket.io-client) and node/node_modules (npm) must come along.
+extraResources:
+  - from: build
+    to: .
+    filter: ["bridge/**/*", "node/**/*"]
+
+asar: true
+
+# Chromium's own UI strings: only the app's 10 languages (the rest is 40 MB of unused files)
+electronLanguages: [en-US, en-GB, pl, de, fr, es, it, nl, da, nb, ru]
+compression: maximum
+
+# the app binary is never a general-purpose Node.js (the bridge has its own); no NODE_OPTIONS, no --inspect into it
+electronFuses:
+  runAsNode: false
+  enableNodeOptionsEnvironmentVariable: false
+  enableNodeCliInspectArguments: false
+  onlyLoadAppFromAsar: true
+  enableCookieEncryption: true
+
+win:
+  target:
+    - target: nsis
+      arch: [x64]
+  icon: build-resources/icon.png
+  artifactName: Hinty-Agents-Setup-${version}.${ext}
+  # Code signing: not yet (Windows shows "unknown publisher"). With a certificate set CSC_LINK / CSC_KEY_PASSWORD, or
+  # use Azure Trusted Signing (win.azureSignOptions).
+
+nsis:
+  # per user, no administrator rights, one click
+  oneClick: true
+  perMachine: false
+  allowElevation: false
+  runAfterFinish: true
+  createDesktopShortcut: true
+  createStartMenuShortcut: true
+  shortcutName: Hinty Agents
+  uninstallDisplayName: Hinty Agents
+  deleteAppDataOnUninstall: true
+  include: build-resources/installer.nsh
+
+mac:
+  target:
+    - target: dmg
+  category: public.app-category.developer-tools
+  icon: build-resources/icon.png
+  hardenedRuntime: true
+  gatekeeperAssess: false
+  entitlements: build-resources/entitlements.mac.plist
+  entitlementsInherit: build-resources/entitlements.mac.plist
+  # the bundled Node.js is signed with our Developer ID and the hardened runtime like the app (notarization needs it)
+  binaries:
+    - Contents/Resources/node/bin/node
+  # notarytool with APPLE_ID, APPLE_APP_SPECIFIC_PASSWORD and APPLE_TEAM_ID from the environment (the workflow)
+  notarize: true
+
+dmg:
+  artifactName: Hinty-Agents-${version}-${arch}.${ext}

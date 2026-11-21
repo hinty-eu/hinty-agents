@@ -39,8 +39,9 @@ export function cleanAccount(v) {
 }
 
 /**
- * @param {{ api: string, label?: string, host?: string, io?: typeof ioDefault, maxCodes?: number,
+ * @param {{ api: string, label?: string, host?: string, io?: typeof ioDefault, maxCodes?: number, signal?: AbortSignal,
  *   onCode: (code: string, expiresIn: number) => void }} o
+ *   signal: aborting it closes the connection and rejects with `cancelled` (the desktop app's Cancel button)
  * @returns {Promise<{ token: string, bridgeId: string, account: string | null, checkHash: string | null }>}
  */
 export function pair(o) {
@@ -63,6 +64,10 @@ export function pair(o) {
       s.close()
       if (err) reject(err)
       else resolve(/** @type {any} */ (val))
+    }
+    if (o.signal) {
+      if (o.signal.aborted) return finish(new Error('cancelled'))
+      o.signal.addEventListener('abort', () => finish(new Error('cancelled')), { once: true })
     }
     const ask = () => {
       if (codes >= maxCodes) return finish(new Error('pairing_timeout'))

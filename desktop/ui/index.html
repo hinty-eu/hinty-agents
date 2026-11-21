@@ -1,0 +1,30 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'self'; style-src 'self'; img-src 'self' data:; connect-src 'none'; form-action 'none'; base-uri 'none'; frame-ancestors 'none'">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Hinty Agents</title>
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+  <header>
+    <div class="brand">
+      <svg class="bars" viewBox="0 0 14 9" aria-hidden="true"><rect x="0" y="4.1" width="2.2" height="4.9"/><rect x="3.9" y="0" width="2.2" height="9"/><rect x="7.8" y="2.3" width="2.2" height="6.7"/><rect x="11.7" y="5.4" width="2.2" height="3.6"/></svg>
+      <span class="name">Hinty Agents</span>
+    </div>
+    <p class="tagline" id="tagline"></p>
+  </header>
+  <div id="banner" class="banner" hidden></div>
+  <section class="card" id="account" data-testid="account"></section>
+  <section class="card" id="away" data-testid="away"></section>
+  <section class="card" id="agents" data-testid="agents"></section>
+  <section class="card" id="voice" data-testid="voice"></section>
+  <section class="card" id="settings" data-testid="settings"></section>
+  <section class="card danger" id="remove" data-testid="remove"></section>
+  <section class="card log" id="log"></section>
+  <footer id="footer"></footer>
+  <script src="i18n.js"></script>
+  <script src="app.js"></script>
+</body>
+</html>

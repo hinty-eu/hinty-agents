@@ -119,20 +119,56 @@ The Claude Code mod writes an instruction's id and length (not its text) to Clau
 - **Pin the version you install**: `npx hinty-agents@<version>`; a plain `npx hinty-agents` may fetch a newer release,
   and the hooks start the service from the copy you installed.
 
+## Desktop app (Windows, macOS)
+
+For people who do not use a terminal: **Hinty Agents** is an installer with a small window and an icon next to the
+clock. Node.js comes inside it, nothing else needs to be installed (only the agents themselves and a Hinty account).
+
+- **Windows:** `Hinty-Agents-Setup-<version>.exe`, one click, for your user only (no administrator rights). Not signed
+  yet: Windows SmartScreen says "unknown publisher" (More info -> Run anyway).
+- **macOS:** `Hinty-Agents-<version>-arm64.dmg` (Apple silicon) or `-x64.dmg` (Intel), signed with a Developer ID and
+  notarized by Apple, built by `.github/workflows/desktop-mac.yml`.
+
+The window does what the wizard does, with buttons: it shows the pairing code (type it at hinty.eu, Voice Assistant ->
+Agents) and then asks for the 4-digit number the panel shows; it switches away mode on and off; it has the remote
+switch-on consent as its own checkbox (off by default, with the risk written next to it); it finds Claude Code, Codex,
+Grok Build, OpenClaw and Hermes and connects or disconnects each one (the same `install` / `uninstall` as below, with the
+Codex trust note and the Grok `--ask-shell` warning); it installs the voice with a progress bar; "Remove everything" is
+`uninstall --all` (with `--purge` if you tick "also delete my data"). It starts with your session in the background
+(next to the clock, no window; a checkbox turns that off) and keeps the service running while this computer is paired.
+Ten languages, the system's by default.
+
+Under the window it is this same package, unchanged: the app starts `bin/hinty-agents.js desktop` on its own Node.js and
+every button is one of the commands below (`src/desktop.js`), so the security model above holds as it is. Two things
+differ because the Node.js is the bundled one:
+
+- the program copy `~/.hinty-agents/app/<version>` names that Node.js by its full path in the Claude Code plugin's
+  `hooks.json` (a person without Node.js has no `node` on PATH); the Codex and Grok hooks name it too, as always.
+  Installed from `npx` with Node.js on PATH, `hooks.json` keeps `node`. `doctor` checks that the named Node.js exists;
+- the Electron binary itself never runs code of the bridge: its `RunAsNode`, `NODE_OPTIONS` and `--inspect` fuses are
+  off, the window has no Node.js access (sandbox, context isolation, a fixed list of calls checked twice) and loads
+  nothing from the network.
+
+The bundled Node.js is the official LTS build from nodejs.org, the same version on both systems, its sha256 pinned in
+`desktop/scripts/node-runtime.mjs`. Uninstalling the app (Windows Settings -> Apps) first runs
+`hinty-agents uninstall --all --purge`; an update stops the service and lets the new version start it. Building the
+app: [desktop/README.md](desktop/README.md).
+
 ## Install
 
-Requirements: Node.js 20+, Claude Code (`claude`) with mods enabled (default since 2.1.287), a Hinty account.
+Requirements: Node.js 20+, Claude Code (`claude`) with mods enabled (default since 2.1.287), a Hinty account. (No
+Node.js? Use the [desktop app](#desktop-app-windows-macos).)
 
 Run it with `npx`. **Pin the version** (the hooks run on your machine, so you decide when to update):
 
 ```bash
-npx hinty-agents@0.3.2
+npx hinty-agents@0.4.0
 ```
 
 Or straight from GitHub (a tag, not a branch):
 
 ```bash
-npx github:hinty-eu/hinty-agents#v0.3.2
+npx github:hinty-eu/hinty-agents#v0.4.0
 ```
 
 **Where it lives.** `npx` runs from npm's cache, which npm may clean at any time. So setup (and `start`, `install`)
@@ -414,6 +450,7 @@ claude plugin validate ./claude-plugin        # check the manifest, hooks and mo
 ```
 
 Run from a clone (`git clone https://github.com/hinty-eu/hinty-agents`, `npm install`, `node bin/hinty-agents.js`): a checkout runs in place, no copy.
+The desktop app is a separate package in `desktop/` (Electron, not part of the npm package): see [desktop/README.md](desktop/README.md).
 Use `HINTY_AGENTS_HOME` and `HINTY_AGENTS_API` to keep a test service away from your real one. Plain JavaScript with
 JSDoc types (no build step); the only dependency is `socket.io-client` (the speech engine and models are installed on
 demand by `voice install`). The mod's types come from Claude Code: once it has loaded the plugin,

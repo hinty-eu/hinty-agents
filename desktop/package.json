@@ -1,0 +1,24 @@
+{
+  "name": "hinty-agents-desktop",
+  "productName": "Hinty Agents",
+  "version": "0.4.0",
+  "private": true,
+  "description": "Hinty Agents desktop app: pair this computer with your Hinty account, switch away-from-desk mode, connect your AI coding agents. Bundles Node.js, so nothing else needs to be installed.",
+  "author": "Hinty <support@hinty.eu> (https://www.hinty.eu)",
+  "license": "MIT",
+  "homepage": "https://www.hinty.eu/assistant/agents",
+  "main": "main.cjs",
+  "scripts": {
+    "stage": "node scripts/stage.mjs",
+    "start": "node scripts/stage.mjs && electron .",
+    "icons": "node scripts/icons.mjs",
+    "dir": "node scripts/stage.mjs && electron-builder --dir --config electron-builder.yml",
+    "dist:win": "node scripts/stage.mjs --platform win32 --arch x64 && electron-builder --win nsis --x64 --config electron-builder.yml",
+    "dist:mac:arm64": "node scripts/stage.mjs --platform darwin --arch arm64 && electron-builder --mac dmg --arm64 --config electron-builder.yml",
+    "dist:mac:x64": "node scripts/stage.mjs --platform darwin --arch x64 && electron-builder --mac dmg --x64 --config electron-builder.yml"
+  },
+  "devDependencies": {
+    "electron": "^45.4.1",
+    "electron-builder": "^26.18.0"
+  }
+}
