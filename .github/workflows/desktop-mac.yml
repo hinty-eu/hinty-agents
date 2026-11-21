@@ -1,19 +1,27 @@
-# Hinty Agents desktop app for macOS: a signed and notarized DMG per processor (Apple silicon and Intel).
-# Run by hand (Actions -> "Desktop app (macOS)" -> Run workflow) or by pushing a tag desktop-v<version>.
+# Hinty Agents desktop app for macOS: an UNSIGNED build check (pull requests that touch the app or the bridge, or by
+# hand). It proves the DMG still builds for both processors and that the bundled Node.js is the pinned one; nothing is
+# uploaded or published, and an unsigned DMG is never shipped.
 #
-# Secrets (Settings -> Secrets and variables -> Actions); without all of them the job stops at the first step:
-#   MAC_CERT_P12_BASE64          the "Developer ID Application" certificate with its private key, exported as .p12,
-#                                base64 (base64 -i cert.p12 | pbcopy)
-#   MAC_CERT_PASSWORD            the password of that .p12
-#   APPLE_ID                     the Apple ID e-mail of the developer account
-#   APPLE_APP_SPECIFIC_PASSWORD  an app-specific password for it (appleid.apple.com -> Sign-In and Security)
-#   APPLE_TEAM_ID                the 10-character team ID (developer.apple.com -> Membership)
-name: Desktop app (macOS)
+# The signed and notarized DMGs are not built here: this repository is public and holds no Apple secret (certificate,
+# App Store Connect key). They are built from a tag of this repository in a separate private build repository, which
+# signs the app and every binary in it with the Developer ID, notarizes and staples the app and the DMG, checks them
+# with codesign, stapler and spctl, and tests the installed app end to end. The DMGs are then attached to the release
+# here by hand.
+name: Desktop app (macOS, unsigned check)
 
 on:
   workflow_dispatch:
-  push:
-    tags: ['desktop-v*']
+  pull_request:
+    paths:
+      - 'desktop/**'
+      - 'src/**'
+      - 'bin/**'
+      - 'claude-plugin/**'
+      - 'hermes-plugin/**'
+      - 'hooks/**'
+      - 'package.json'
+      - 'package-lock.json'
+      - '.github/workflows/desktop-mac.yml'
 
 permissions:
   contents: read
@@ -25,31 +33,15 @@ concurrency:
 jobs:
   dmg:
     runs-on: macos-latest
-    timeout-minutes: 45
+    timeout-minutes: 30
     strategy:
       fail-fast: false
       matrix:
         arch: [arm64, x64]
     steps:
-      - name: Check the signing secrets
-        env:
-          MAC_CERT_P12_BASE64: ${{ secrets.MAC_CERT_P12_BASE64 }}
-          MAC_CERT_PASSWORD: ${{ secrets.MAC_CERT_PASSWORD }}
-          APPLE_ID: ${{ secrets.APPLE_ID }}
-          APPLE_APP_SPECIFIC_PASSWORD: ${{ secrets.APPLE_APP_SPECIFIC_PASSWORD }}
-          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
-        run: |
-          missing=""
-          for name in MAC_CERT_P12_BASE64 MAC_CERT_PASSWORD APPLE_ID APPLE_APP_SPECIFIC_PASSWORD APPLE_TEAM_ID; do
-            if [ -z "${!name}" ]; then missing="$missing $name"; fi
-          done
-          if [ -n "$missing" ]; then
-            echo "::error title=Signing secrets missing::Add these repository secrets first:$missing (see the top of .github/workflows/desktop-mac.yml). Nothing was built: an unsigned, unnotarized app would be blocked by Gatekeeper."
-            exit 1
-          fi
-          echo "All signing secrets are set."
-
       - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
 
       - uses: actions/setup-node@v4
         with:
@@ -62,27 +54,25 @@ jobs:
         working-directory: desktop
         run: npm ci
 
-      - name: Build, sign and notarize the DMG
+      - name: Build the DMG (unsigned, not notarized)
         working-directory: desktop
         env:
-          CSC_LINK: ${{ secrets.MAC_CERT_P12_BASE64 }}
-          CSC_KEY_PASSWORD: ${{ secrets.MAC_CERT_PASSWORD }}
-          APPLE_ID: ${{ secrets.APPLE_ID }}
-          APPLE_APP_SPECIFIC_PASSWORD: ${{ secrets.APPLE_APP_SPECIFIC_PASSWORD }}
-          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
-        run: npm run dist:mac:${{ matrix.arch }}
+          CSC_IDENTITY_AUTO_DISCOVERY: 'false'
+        run: |
+          node scripts/stage.mjs --platform darwin --arch ${{ matrix.arch }}
+          npx --no-install electron-builder --mac dmg --${{ matrix.arch }} --publish never -c.mac.notarize=false
+          ls -l dist/*.dmg
 
-      - name: Check the signature and the notarization ticket
+      - name: Check the processor and the bundled Node.js
         working-directory: desktop
         run: |
           app=$(ls -d dist/mac*/"Hinty Agents.app" | head -n 1)
-          codesign --verify --deep --strict --verbose=2 "$app"
-          codesign --verify --strict --verbose=2 "$app/Contents/Resources/node/bin/node"
-          xcrun stapler validate "$app"
-          spctl --assess --type execute --verbose "$app"
-
-      - uses: actions/upload-artifact@v4
-        with:
-          name: Hinty-Agents-mac-${{ matrix.arch }}
-          path: desktop/dist/*.dmg
-          if-no-files-found: error
+          want=$([ "${{ matrix.arch }}" = x64 ] && echo x86_64 || echo arm64)
+          node_bin="$app/Contents/Resources/node/bin/node"
+          [ "$(lipo -archs "$app/Contents/MacOS/Hinty Agents")" = "$want" ]
+          [ "$(lipo -archs "$node_bin")" = "$want" ]
+          pinned=$(node -p "require('./build/node/RUNTIME.json').node")
+          if [ "${{ matrix.arch }}" = arm64 ]; then
+            [ "$("$node_bin" --version)" = "v$pinned" ]
+            echo "bundled Node.js v$pinned runs"
+          fi

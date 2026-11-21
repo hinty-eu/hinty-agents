@@ -1,5 +1,6 @@
-# Hinty Agents desktop app. Build: npm run dist:win (Windows NSIS), npm run dist:mac:arm64 / dist:mac:x64 (macOS DMG,
-# see .github/workflows/desktop-mac.yml). `npm run stage` first puts the bridge and the pinned Node.js into build/.
+# Hinty Agents desktop app. Build: npm run dist:win (Windows NSIS), npm run dist:mac:arm64 / dist:mac:x64 (macOS DMG;
+# signed and notarized only in the private build repository, see desktop/README.md "Signing"). `npm run stage` first
+# puts the bridge and the pinned Node.js into build/.
 appId: eu.hinty.agents
 productName: Hinty Agents
 copyright: Copyright (c) 2026 Hinty
@@ -70,7 +71,8 @@ mac:
   # the bundled Node.js is signed with our Developer ID and the hardened runtime like the app (notarization needs it)
   binaries:
     - Contents/Resources/node/bin/node
-  # notarytool with APPLE_ID, APPLE_APP_SPECIFIC_PASSWORD and APPLE_TEAM_ID from the environment (the workflow)
+  # notarytool with the App Store Connect API key from the environment (APPLE_API_KEY = path of the .p8,
+  # APPLE_API_KEY_ID, APPLE_API_ISSUER), set only by the private build repository; skipped when the app is not signed
   notarize: true
 
 dmg:

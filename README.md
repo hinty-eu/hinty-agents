@@ -127,7 +127,9 @@ clock. Node.js comes inside it, nothing else needs to be installed (only the age
 - **Windows:** `Hinty-Agents-Setup-<version>.exe`, one click, for your user only (no administrator rights). Not signed
   yet: Windows SmartScreen says "unknown publisher" (More info -> Run anyway).
 - **macOS:** `Hinty-Agents-<version>-arm64.dmg` (Apple silicon) or `-x64.dmg` (Intel), signed with a Developer ID and
-  notarized by Apple, built by `.github/workflows/desktop-mac.yml`.
+  notarized by Apple. Built from the release tag in a private build repository (it holds the signing certificate and
+  the App Store Connect key, which never come into this public one); `.github/workflows/desktop-mac.yml` here only
+  checks that the app still builds, unsigned.
 
 The window does what the wizard does, with buttons: it shows the pairing code (type it at hinty.eu, Voice Assistant ->
 Agents) and then asks for the 4-digit number the panel shows; it switches away mode on and off; it has the remote

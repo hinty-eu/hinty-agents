@@ -7,8 +7,9 @@ Desktop app for people who do not use a terminal (`desktop/`, README "Desktop ap
 - **Hinty Agents app** (Electron): a window and a tray icon, 10 languages. Pairing with the code and the 4-digit check,
   away mode, the remote switch-on consent as its own checkbox (off by default, risk next to it), connect / disconnect
   each agent, voice install with a progress bar, "Remove everything", start at sign-in in the background. Windows: a
-  one-click NSIS installer per user, no administrator rights. macOS: a signed, notarized DMG per processor from
-  `.github/workflows/desktop-mac.yml` (needs the signing secrets; stops when they are missing).
+  one-click NSIS installer per user, no administrator rights. macOS: a signed, notarized DMG per processor, built from the
+  tag in a private build repository (the Apple secrets never come into this public one);
+  `.github/workflows/desktop-mac.yml` is an unsigned build check.
 - **Node.js inside**: the official LTS build (26.13.1, sha256 of each archive pinned in
   `desktop/scripts/node-runtime.mjs`), not Electron's binary in run-as-node mode: the agents start hooks by a command line
   that cannot carry an environment variable, npm is needed for the voice engine, and Electron's RunAsNode,

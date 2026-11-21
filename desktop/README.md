@@ -24,7 +24,7 @@ Once, in the repository root: `npm ci` (the bridge's one dependency, `socket.io-
 npm ci
 npm run dir            # stage + unpacked app in dist/win-unpacked (or dist/mac*) for a quick look
 npm run dist:win       # Windows installer: dist/Hinty-Agents-Setup-<version>.exe
-npm run dist:mac:arm64 # macOS DMG for Apple silicon (on a Mac; signing and notarization need the env below)
+npm run dist:mac:arm64 # macOS DMG for Apple silicon (on a Mac; signing and notarization need the env under Signing)
 npm run dist:mac:x64   # macOS DMG for Intel
 ```
 
@@ -41,10 +41,13 @@ Changing the Node.js version: edit `NODE_VERSION` and copy the four sha256 value
 
 ## Signing
 
-- **macOS** (`.github/workflows/desktop-mac.yml`): a "Developer ID Application" certificate (`MAC_CERT_P12_BASE64`,
-  `MAC_CERT_PASSWORD`) and notarization with an app-specific password (`APPLE_ID`, `APPLE_APP_SPECIFIC_PASSWORD`,
-  `APPLE_TEAM_ID`). The bundled `node` is signed with the same identity and the hardened runtime (entitlements: JIT for
-  V8, library validation off for the voice engine npm installs later). Without the secrets the workflow stops at once.
+- **macOS**: signed and notarized in a private build repository, from a tag of this one (this public repository holds
+  no Apple secret). There electron-builder gets the "Developer ID Application" certificate (`CSC_LINK`,
+  `CSC_KEY_PASSWORD`) and notarizes the app with an App Store Connect API key (`APPLE_API_KEY` = path of the `.p8`,
+  `APPLE_API_KEY_ID`, `APPLE_API_ISSUER`); the DMG is signed (`-c.dmg.sign=true`), notarized with `notarytool` and
+  stapled. The bundled `node` is signed with the same identity and the hardened runtime (entitlements: JIT for V8,
+  library validation off for the voice engine npm installs later). `.github/workflows/desktop-mac.yml` here is an
+  unsigned build check (`CSC_IDENTITY_AUTO_DISCOVERY=false`, `-c.mac.notarize=false`).
 - **Windows**: not signed yet (SmartScreen: "unknown publisher"). With a certificate: `CSC_LINK` / `CSC_KEY_PASSWORD`,
   or Azure Trusted Signing (`win.azureSignOptions` in `electron-builder.yml`). Sign `resources/node/node.exe` too
   (`win.signExts` or a sign hook), since the agents start it.
