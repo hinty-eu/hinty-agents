@@ -128,7 +128,7 @@ export class Service {
   }
 
   hello() {
-    this.send('hello', { v: PROTOCOL_V, host: this.host, agents: this.agentsInfo().agents, away: this.away.isOn(), ...(this.voiceReady() ? { stt: true } : {}) })
+    this.send('hello', { v: PROTOCOL_V, host: this.host, agents: this.agentsInfo().agents, away: this.away.isOn(), remoteAway: this.remoteAwayAllowed() === true, ...(this.voiceReady() ? { stt: true } : {}) })
   }
 
   /** @param {import('./sessions.js').Session} s */

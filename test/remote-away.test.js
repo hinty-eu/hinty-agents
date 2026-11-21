@@ -89,3 +89,17 @@ test('consent is read at every remote request: withdrawn consent refuses the nex
   assert.equal(s.away.isOn(), false)
   s.stop()
 })
+
+test('hello carries remoteAway from the consent and a repeated hello follows a change', () => {
+  const { s, r, allow } = svc()
+  const hellos = () => r.sent.filter(([e]) => e === 'hello').map(([, p]) => p)
+  s.hello()
+  assert.equal(hellos().at(-1).remoteAway, false)
+  allow(true)
+  s.agentsChanged()
+  assert.equal(hellos().at(-1).remoteAway, true)
+  allow(false)
+  s.agentsChanged()
+  assert.equal(hellos().at(-1).remoteAway, false)
+  s.stop()
+})

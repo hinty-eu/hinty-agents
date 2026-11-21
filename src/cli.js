@@ -414,6 +414,7 @@ async function remoteAwayCmd(arg) {
   }
   if (!readConfig()) { out('Not paired yet. Run: npx hinty-agents'); return 1 }
   updateConfig({ remoteAwayOn: arg === 'on' })
+  await tellAgents() // a running service says `hello` again with the new `remoteAway`
   if (arg === 'on') {
     for (const l of REMOTE_AWAY_TEXT) out(l)
     out(`\n${c.ok('✓')} Remote switch-on ALLOWED. Undo: npx hinty-agents remote-away off`)

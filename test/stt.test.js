@@ -244,10 +244,10 @@ test('E3: link lost drops the utterance silently', async () => {
 test('E3: hello carries stt:true only when the voice is ready; voiceChanged says hello again', () => {
   const { relay, svc } = setup({ ready: false })
   svc.hello()
-  assert.deepEqual(relay.sent.at(-1)[1], { v: 1, host: 'h', agents: ['claude'], away: true })
+  assert.deepEqual(relay.sent.at(-1)[1], { v: 1, host: 'h', agents: ['claude'], away: true, remoteAway: false })
   svc.voiceReady = () => true
   assert.deepEqual(svc.voiceChanged(), { ok: true, stt: true })
-  assert.deepEqual(relay.sent.at(-1), ['hello', { v: 1, host: 'h', agents: ['claude'], away: true, stt: true }])
+  assert.deepEqual(relay.sent.at(-1), ['hello', { v: 1, host: 'h', agents: ['claude'], away: true, remoteAway: false, stt: true }])
   svc.stop()
 })
 
